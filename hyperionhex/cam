@@ -1,0 +1,2405 @@
+/*
+  KewlCam v2 — ESP32-CAM  (SD-first capture, 3× WiFi, browser-to-Telegram)
+  ────────────────────────────────────────────────────────────────────────
+  Board     : AI Thinker ESP32-CAM (PSRAM required)
+  Core      : esp32 Arduino 3.x (2.x guarded where it costs nothing)
+  Partition : Minimal SPIFFS (1.9 MB APP / OTA / 190 KB SPIFFS)
+  OTA       : curl -F "image=@firmware.bin" http://kewlcam.local/update
+  SD        : onboard microSD, 1-bit SDIO (GPIO 14 CLK / 15 CMD / 2 D0)
+  Flash LED : GPIO 4, PWM-dimmed (full brightness browns out the SD card)
+  Button    : GPIO 13 → GND, hardware interrupt, handled by its own task
+
+  ── WIRING NOTE ─────────────────────────────────────────────────────────
+  Do NOT put the button on GPIO 0. GPIO 0 is XCLK — the 20 MHz clock the
+  ESP32 feeds to the OV2640. Grounding it stops the camera and, at power-on,
+  puts the chip into flash-download mode. Move the wire to IO13 (GND is two
+  pins away on the same header). IO3/U0R also works — see BUTTON_PIN below.
+
+  ── DESIGN ──────────────────────────────────────────────────────────────
+  Every photo hits the SD card BEFORE any network work is attempted, so a
+  shot is never lost to a dead/slow/absent uplink. Photos that could not be
+  delivered leave a marker in /QUEUE; a background task drains that queue
+  whenever WiFi returns, and an open browser can drain it over the phone's
+  mobile data when the camera itself has no internet. Markers live on the
+  card, so the queue survives a reboot or a power cut.
+
+  Three tasks, so a stuck upload can never delay the shutter:
+    loop()   core 1  — web server, LED, housekeeping, watchdog
+    camTask  core 1  — button/web capture → SD                (prio 5)
+    netTask  core 0  — WiFi connect/roam + Telegram uploads    (prio 2)
+*/
+
+#include <WiFi.h>
+#include <WiFiMulti.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Update.h>
+#include <WiFiClientSecure.h>
+#include <Preferences.h>
+#include <FS.h>
+#include <SD_MMC.h>
+#include <time.h>
+#include "esp_camera.h"
+#include "esp_task_wdt.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include "driver/gpio.h"
+#include <lwip/sockets.h>
+#include <errno.h>
+
+#ifndef ESP_ARDUINO_VERSION_MAJOR
+#define ESP_ARDUINO_VERSION_MAJOR 2
+#endif
+
+/*═══════════════════════════════════════════════════════════════════════╗
+║  1. EDIT THIS BLOCK                                                    ║
+╚═══════════════════════════════════════════════════════════════════════*/
+
+// Up to 3 networks. Leave a slot as "" to skip it. All three can also be
+// set from the web UI (Device tab) without reflashing — those override
+// these defaults and are kept in NVS.
+#define WIFI1_SSID  ""
+#define WIFI1_PASS  ""
+#define WIFI2_SSID  ""              // ← second network
+#define WIFI2_PASS  ""
+#define WIFI3_SSID  ""              // ← third network
+#define WIFI3_PASS  ""
+
+#define AP_SSID     "KewlCam"
+#define AP_PASS     "kewlcam2026"   // ≥8 chars, or nullptr for an open AP.
+                                    // The bot token is served to the browser,
+                                    // so an open AP hands it to anyone nearby.
+#define BOT_TOKEN   ""
+#define CHAT_ID     ""
+
+#define BUTTON_PIN  13   // ← physical shutter button to GND.
+                         //   13 = header pad next to GND (recommended)
+                         //    3 = U0R header pad (also free; loses serial RX)
+                         //    0 = NOT USABLE, it is the camera XCLK
+
+// Below this the camera looks for a better saved network; it only switches if
+// one is at least ROAM_MARGIN_DBM stronger, so it cannot flap between two.
+#define ROAM_TRIGGER_DBM (-73)
+#define ROAM_MARGIN_DBM    8
+
+#define BOT_COMMANDS      1          // 1 = listen for /photo etc. from Telegram
+#define BOT_POLL_SECONDS 20          // long-poll window; commands land instantly
+
+#define TZ_INFO     "IST-5:30"       // photo timestamps; e.g. "UTC0", "EST5EDT"
+#define CPU_MHZ     240              // 240 fastest · 160 balanced · 80 coolest
+// ON by default now. With one radio, AP+STA time-slices the air, which on a
+// weak uplink is the difference between a page loading and timing out; it can
+// also send replies for inbound STA connections out of the AP interface.
+// softAPdisconnect() does recreate the netifs and drop the listening socket,
+// so every AP transition triggers a rebind that is then VERIFIED via
+// server.listening() — the failure that used to be silent now cannot be.
+// The AP returns automatically whenever the STA link drops.
+#define AP_AUTO_OFF 1
+#define AP_GRACE_MS 60000UL          // keep the AP this long after boot anyway
+#define AUTO_REBOOT_HOURS 24         // 0 = never. Only reboots when fully idle.
+
+/*═══════════════════════════════════════════════════════════════════════╗
+║  2. Board constants — do not change for AI-Thinker                     ║
+╚═══════════════════════════════════════════════════════════════════════*/
+
+#define PWDN_GPIO_NUM   32
+#define RESET_GPIO_NUM  -1
+#define XCLK_GPIO_NUM    0
+#define SIOD_GPIO_NUM   26
+#define SIOC_GPIO_NUM   27
+#define Y9_GPIO_NUM     35
+#define Y8_GPIO_NUM     34
+#define Y7_GPIO_NUM     39
+#define Y6_GPIO_NUM     36
+#define Y5_GPIO_NUM     21
+#define Y4_GPIO_NUM     19
+#define Y3_GPIO_NUM     18
+#define Y2_GPIO_NUM      5
+#define VSYNC_GPIO_NUM  25
+#define HREF_GPIO_NUM   23
+#define PCLK_GPIO_NUM   22
+#define FLASH_PIN        4
+#define STATUS_LED_PIN  33   // onboard red LED, active LOW
+
+#define FLASH_LEDC_CH    7   // camera XCLK owns LEDC ch0/timer0 — stay clear
+#define BTN_LOCKOUT_MS 350   // ignore re-triggers (debounce + double-shot guard)
+#define BTN_CONFIRM_MS   3   // reject sub-3 ms EMI spikes on a long button wire
+#define FLASH_SETTLE_FRAMES 2
+#define WDT_SECONDS     60
+#define SD_MIN_FREE_MB  60   // below this the oldest photos are recycled
+#define PRUNE_EVERY     25   // photos between free-space checks
+
+/*═══════════════════════════════════════════════════════════════════════╗
+║  3. State                                                              ║
+╚═══════════════════════════════════════════════════════════════════════*/
+
+static const framesize_t FRAMESIZES[] = {
+  FRAMESIZE_QVGA, FRAMESIZE_VGA, FRAMESIZE_SVGA,
+  FRAMESIZE_XGA,  FRAMESIZE_SXGA, FRAMESIZE_UXGA
+};
+
+struct CamCfg {
+  int effect = 0, brightness = 0, contrast = 0, sat = 0, sharpness = 0;
+  int wb_mode = 0, hmirror = 0, vflip = 0;
+  int quality = 8, res_idx = 2;      // 2 = SVGA
+  int flash = 0, flash_duty = 70;    // flash off by default = fastest shutter
+} g_cam;
+
+/*
+  WebServer::begin() is void and NetworkServer::begin() bails out silently if
+  socket()/bind()/listen() fails, so "I called begin()" proves nothing. The
+  real state lives in NetworkServer::_server, which is protected — a two-line
+  subclass turns it into something we can actually assert on.
+*/
+class KewlWebServer : public WebServer {
+public:
+  explicit KewlWebServer(int port) : WebServer(port) {}
+  bool listening() { return (bool)_server; }
+};
+KewlWebServer server(80);
+WiFiMulti   wifiMulti;
+Preferences prefs;
+
+TaskHandle_t      g_camTask = nullptr, g_netTask = nullptr;
+SemaphoreHandle_t g_camMux, g_sdMux, g_nvsMux;
+
+// The SD lock is recursive: queueAdd() counts the queue while already holding
+// it, and the alternative is two variants of every card helper.
+#define SD_LOCK(ms) (xSemaphoreTakeRecursive(g_sdMux, pdMS_TO_TICKS(ms)) == pdTRUE)
+#define SD_UNLOCK() xSemaphoreGiveRecursive(g_sdMux)
+
+volatile uint32_t g_btnIsrMs   = 0;
+volatile bool     g_busyCapture = false;
+
+bool     g_sdOK = false, g_camOK = false, g_apOn = false, g_timeOK = false;
+uint32_t g_nextNum = 1, g_oldestNum = 1, g_lastNum = 0, g_lastLen = 0;
+uint32_t g_pending = 0, g_sentTotal = 0, g_shotTotal = 0;
+uint32_t g_camFails = 0, g_sdFails = 0, g_sendFails = 0;
+uint32_t g_bootMs = 0, g_lastActivity = 0;
+// The browser only ever claims ONE specific photo (the one it just captured or
+// is relaying). It can no longer gate the whole queue.
+uint32_t g_claimNum = 0, g_claimUntil = 0;
+uint32_t g_firstFailMs = 0;   // when the current run of send failures started
+uint32_t g_wifiDrops   = 0;   // STA disconnect count — the key slowness signal
+// Set by netTask when the STA lands an IP; loop() owns the server object and
+// does the actual rebind, so the two tasks never touch it at once.
+volatile bool g_rebindServer = false;
+bool g_apManual = false;      // /ap on — suppresses the automatic shutdown
+
+#if BOT_COMMANDS
+int64_t g_tgOffset = 0;       // next getUpdates id; persisted so a reboot does
+bool    g_tgOffsetInit = false;  // not replay commands already acted on
+#endif
+uint32_t g_cfgDirtyAt = 0;
+
+// Last-resort in-PSRAM copy, used only when the SD write itself failed.
+uint8_t* g_ramBuf = nullptr;
+size_t   g_ramLen = 0;
+uint32_t g_ramNum = 0;
+
+char g_ssid[3][33] = { WIFI1_SSID, WIFI2_SSID, WIFI3_SSID };
+char g_pass[3][65] = { WIFI1_PASS, WIFI2_PASS, WIFI3_PASS };
+
+// Non-blocking status LED: queue N blinks, loop() plays them out.
+int           g_blinks = 0;
+bool          g_ledOn  = false;
+uint32_t      g_ledAt  = 0;
+
+static inline void ledSet(bool on) { digitalWrite(STATUS_LED_PIN, on ? LOW : HIGH); g_ledOn = on; }
+static inline void blink(int n)    { g_blinks = n; }
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  #define FLASH_WRITE(d) ledcWrite(FLASH_PIN, (d))
+#else
+  #define FLASH_WRITE(d) ledcWrite(FLASH_LEDC_CH, (d))
+#endif
+
+/*═══════════════════════════════════════════════════════════════════════╗
+║  4. Web page (fully static → served straight from flash, 0 RAM copy)   ║
+╚═══════════════════════════════════════════════════════════════════════*/
+
+static const char PAGE_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KewlCam</title>
+<style>
+:root{--bg1:#0f0c29;--bg2:#302b63;--bg3:#24243e;--acc:#8e54e9;--acc2:#4776e6;
+      --card:rgba(255,255,255,.07);--bd:rgba(255,255,255,.12);
+      --txt:#f1eaff;--mut:#b9b3d9;--ok:#7ee787;--err:#ff7b7b;--busy:#f0c674}
+*{box-sizing:border-box;margin:0;padding:0}
+body{min-height:100vh;font-family:'Segoe UI',Roboto,sans-serif;
+     background:linear-gradient(135deg,var(--bg1),var(--bg2) 50%,var(--bg3));
+     background-attachment:fixed;color:var(--txt);
+     display:flex;flex-direction:column;align-items:center;padding-bottom:70px}
+h1{font-size:1.7rem;margin:14px 0 2px;
+   background:linear-gradient(90deg,#a276f0,#4776e6);
+   -webkit-background-clip:text;background-clip:text;color:transparent}
+.sub{color:var(--mut);font-size:.82rem;margin-bottom:8px}
+.tabs{position:sticky;top:0;z-index:10;
+      background:rgba(15,12,41,.92);backdrop-filter:blur(12px);
+      display:flex;gap:5px;width:100%;max-width:440px;
+      padding:8px 10px;border-bottom:1px solid var(--bd);margin-bottom:14px}
+.tab{flex:1;padding:9px 2px;font-size:.72rem;font-weight:700;text-align:center;
+     background:transparent;border:1px solid var(--bd);border-radius:10px;
+     color:var(--mut);cursor:pointer;transition:all .15s}
+.tab.on{background:linear-gradient(135deg,var(--acc),var(--acc2));
+        border-color:transparent;color:#fff;box-shadow:0 3px 12px rgba(142,84,233,.4)}
+.pane{display:none;flex-direction:column;align-items:center;width:100%}
+.pane.on{display:flex}
+.card{width:100%;max-width:420px;background:var(--card);border:1px solid var(--bd);
+      border-radius:18px;padding:18px;margin:0 12px 14px;
+      backdrop-filter:blur(10px);box-shadow:0 8px 32px rgba(0,0,0,.3)}
+.card h2{font-size:.75rem;margin:0 0 12px;color:var(--mut);
+         font-weight:700;text-transform:uppercase;letter-spacing:1px}
+.btn-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}
+.sbtn{padding:15px 8px;font-size:.95rem;font-weight:700;border:none;
+      border-radius:14px;color:#fff;cursor:pointer;transition:transform .15s,box-shadow .15s}
+.tg{background:linear-gradient(135deg,var(--acc),var(--acc2));
+    box-shadow:0 6px 18px rgba(142,84,233,.45)}
+.wa{background:linear-gradient(135deg,#25d366,#128c7e);
+    box-shadow:0 6px 18px rgba(37,211,102,.4)}
+.sbtn:hover{transform:translateY(-2px)}.sbtn:active{transform:scale(.97)}
+.sbtn:disabled{opacity:.5;transform:none}
+#prev{display:none;width:100%;border-radius:12px;border:1px solid var(--bd);margin-top:10px}
+.fg{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}
+.fp{padding:10px 3px;font-size:.68rem;font-weight:700;border-radius:10px;
+    border:1px solid var(--bd);background:rgba(255,255,255,.05);
+    color:var(--txt);cursor:pointer;transition:all .15s;text-align:center;line-height:1.5}
+.fp:hover{background:rgba(255,255,255,.12)}.fp:active{transform:scale(.96)}
+.fp.on{background:linear-gradient(135deg,var(--acc),var(--acc2));
+       border-color:transparent;box-shadow:0 3px 12px rgba(142,84,233,.5)}
+.fi{font-size:1.1rem;display:block;margin-bottom:1px}
+.srow{display:flex;align-items:center;justify-content:space-between;
+      gap:10px;margin-bottom:13px}
+.srow label{font-size:.82rem;color:var(--mut);min-width:88px}
+.srow input[type=range]{flex:1;accent-color:var(--acc);height:4px}
+.srow select,.srow input[type=text],.srow input[type=password]{flex:1;font-size:.82rem;
+      background:var(--bg3);border:1px solid var(--bd);
+      color:var(--txt);border-radius:8px;padding:6px 8px;min-width:0}
+.sv{font-size:.8rem;min-width:20px;text-align:right}
+.togs{display:flex;gap:8px;flex:1}
+.tog{padding:7px 10px;font-size:.78rem;font-weight:700;border:1px solid var(--bd);
+     border-radius:8px;background:rgba(255,255,255,.05);color:var(--mut);cursor:pointer;transition:all .15s}
+.tog.on{background:linear-gradient(135deg,var(--acc),var(--acc2));border-color:transparent;color:#fff}
+.kv{display:flex;justify-content:space-between;font-size:.8rem;padding:5px 0;
+    border-bottom:1px solid rgba(255,255,255,.06)}
+.kv:last-child{border:none}
+.kv b{font-weight:600;color:var(--mut)}
+.gal{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.gal a{display:block;aspect-ratio:4/3;overflow:hidden;border-radius:8px;border:1px solid var(--bd)}
+.gal img{width:100%;height:100%;object-fit:cover;display:block}
+.mini{padding:9px;font-size:.78rem;font-weight:700;border:1px solid var(--bd);
+      border-radius:10px;background:rgba(255,255,255,.05);color:var(--txt);cursor:pointer;width:100%}
+.mini:active{transform:scale(.98)}
+.warn{font-size:.74rem;color:var(--busy);margin-top:8px;line-height:1.4}
+#st{position:fixed;bottom:0;left:0;right:0;padding:13px;text-align:center;
+    font-size:.88rem;background:rgba(12,9,35,.93);backdrop-filter:blur(12px);
+    border-top:1px solid var(--bd);min-height:50px}
+#st.ok{color:var(--ok)}#st.err{color:var(--err)}#st.busy{color:var(--busy)}
+.spin{display:inline-block;width:13px;height:13px;
+      border:2px solid rgba(255,255,255,.3);border-top-color:#fff;
+      border-radius:50%;animation:sp .7s linear infinite;
+      margin-right:6px;vertical-align:middle}
+@keyframes sp{to{transform:rotate(360deg)}}
+</style></head>
+<body>
+<h1>&#128247; KewlCam</h1>
+<div class="sub" id="sub">ESP32-CAM</div>
+
+<div class="tabs">
+  <button class="tab on" onclick="switchTab(0,this)">&#128247; Shoot</button>
+  <button class="tab"    onclick="switchTab(1,this)">&#127912; Filters</button>
+  <button class="tab"    onclick="switchTab(2,this)">&#9881; Camera</button>
+  <button class="tab"    onclick="switchTab(3,this)">&#128190; Device</button>
+</div>
+
+<div class="pane on" id="p0">
+  <div class="card">
+    <h2>Quick Capture</h2>
+    <div class="btn-row">
+      <button class="sbtn tg" onclick="go('tg')">&#9992; Telegram</button>
+      <button class="sbtn wa" onclick="go('wa')">&#128241; WhatsApp</button>
+    </div>
+    <img id="prev" alt="">
+  </div>
+  <div class="card">
+    <h2>Live</h2>
+    <div class="kv"><b>SD card</b><span id="k_sd">&hellip;</span></div>
+    <div class="kv"><b>WiFi</b><span id="k_wifi">&hellip;</span></div>
+    <div class="kv"><b>Photos</b><span id="k_n">&hellip;</span></div>
+    <div class="kv"><b>Waiting to send</b><span id="k_q">&hellip;</span></div>
+    <div class="warn" id="offmsg" style="display:none">
+      &#9888; Camera has no internet. Keep this page open with mobile data ON —
+      queued photos are being relayed through your phone.</div>
+  </div>
+</div>
+
+<div class="pane" id="p1">
+  <div class="card"><h2>Filter Presets</h2><div class="fg" id="fgrid"></div></div>
+</div>
+
+<div class="pane" id="p2">
+  <div class="card">
+    <h2>Image Adjustments</h2>
+    <div class="srow"><label>Brightness</label>
+      <input type="range" id="br" min="-2" max="2" value="0" oninput="sl('br',this)">
+      <span class="sv" id="brv">0</span></div>
+    <div class="srow"><label>Contrast</label>
+      <input type="range" id="con" min="-2" max="2" value="0" oninput="sl('con',this)">
+      <span class="sv" id="conv">0</span></div>
+    <div class="srow"><label>Saturation</label>
+      <input type="range" id="sat" min="-2" max="2" value="0" oninput="sl('sat',this)">
+      <span class="sv" id="satv">0</span></div>
+    <div class="srow"><label>Sharpness</label>
+      <input type="range" id="shp" min="-2" max="2" value="0" oninput="sl('shp',this)">
+      <span class="sv" id="shpv">0</span></div>
+  </div>
+  <div class="card">
+    <h2>Camera</h2>
+    <div class="srow"><label>White Balance</label>
+      <select id="wb" onchange="set('wb',this.value)">
+        <option value="0">Auto</option><option value="1">Sunny</option>
+        <option value="2">Cloudy</option><option value="3">Office</option>
+        <option value="4">Home</option>
+      </select></div>
+    <div class="srow"><label>Resolution</label>
+      <select id="res" onchange="set('res',this.value)">
+        <option value="0">QVGA 320&#215;240</option>
+        <option value="1">VGA 640&#215;480</option>
+        <option value="2">SVGA 800&#215;600</option>
+        <option value="3">XGA 1024&#215;768</option>
+        <option value="4">SXGA 1280&#215;1024</option>
+        <option value="5">UXGA 1600&#215;1200</option>
+      </select></div>
+    <div class="srow"><label>JPEG Quality</label>
+      <input type="range" id="q" min="6" max="30" value="8" oninput="sl('q',this)">
+      <span class="sv" id="qv">8</span></div>
+    <div class="srow"><label>Flash LED</label>
+      <div class="togs"><button class="tog" id="tfl" onclick="tog('fl',this)">&#9889; Flash</button></div></div>
+    <div class="srow"><label>Flash power</label>
+      <input type="range" id="fd" min="10" max="255" value="70" oninput="sl('fd',this)">
+      <span class="sv" id="fdv">70</span></div>
+    <div class="srow"><label>Mirror / Flip</label>
+      <div class="togs">
+        <button class="tog" id="thm" onclick="tog('hm',this)">&#8596; Mirror</button>
+        <button class="tog" id="tvf" onclick="tog('vf',this)">&#8597; V-Flip</button>
+      </div></div>
+    <div class="warn">Flash on adds ~150 ms to the shutter (the sensor has to
+      re-expose). Leave it off for the fastest button response.</div>
+  </div>
+</div>
+
+<div class="pane" id="p3">
+  <div class="card">
+    <h2>Status</h2>
+    <div class="kv"><b>Uptime</b><span id="k_up">&hellip;</span></div>
+    <div class="kv"><b>Free heap</b><span id="k_heap">&hellip;</span></div>
+    <div class="kv"><b>Card used</b><span id="k_use">&hellip;</span></div>
+    <div class="kv"><b>Sent / Shot</b><span id="k_cnt">&hellip;</span></div>
+    <div class="kv"><b>IP</b><span id="k_ip">&hellip;</span></div>
+  </div>
+  <div class="card">
+    <h2>Recent on card</h2>
+    <div class="gal" id="gal"></div>
+    <button class="mini" style="margin-top:10px" onclick="loadGal()">&#128260; Refresh</button>
+  </div>
+  <div class="card">
+    <h2>WiFi networks</h2>
+    <button class="mini" style="margin-bottom:10px" onclick="doScan()">&#128246; Scan for networks</button>
+    <div id="scanlist" class="fg" style="grid-template-columns:1fr;margin-bottom:10px"></div>
+    <div id="wrows"></div>
+    <button class="mini" onclick="saveWifi()">&#128190; Save &amp; reboot</button>
+    <div class="warn">Leave a password blank to keep the one already stored.
+      Clear the SSID to disable that slot.</div>
+  </div>
+  <div class="card">
+    <h2>Maintenance</h2>
+    <button class="mini" style="margin-bottom:8px" onclick="if(confirm('Reboot camera?'))fetch('/reboot')">&#128260; Reboot</button>
+    <button class="mini" onclick="retry()">&#9993; Retry queued sends now</button>
+  </div>
+</div>
+
+<div id="st"></div>
+
+<script>
+let CFG={token:'',chat:''}, busy=false, draining=false, lastNum=0, relayHold=0;
+let togState={hm:0,vf:0,fl:0};
+
+function switchTab(n){
+  document.querySelectorAll('.pane').forEach((p,i)=>p.classList.toggle('on',i===n));
+  document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('on',i===n));
+  if(n===3) loadGal();
+}
+function st(t,c){const e=document.getElementById('st');e.className=c||'';e.innerHTML=t}
+function lock(v){busy=v;document.querySelectorAll('.sbtn').forEach(b=>b.disabled=v)}
+function tgUrl(){return 'https://api.telegram.org/bot'+CFG.token+'/sendPhoto'}
+
+const PRESETS=[
+  {n:'Normal',   i:'&#9728;',  fx:0,br:0, con:0, sat:0, shp:0,wb:0},
+  {n:'Vivid',    i:'&#127752;',fx:0,br:0, con:1, sat:2, shp:1,wb:0},
+  {n:'Dramatic', i:'&#127911;',fx:0,br:-1,con:2, sat:1, shp:2,wb:0},
+  {n:'Matte',    i:'&#127807;',fx:0,br:0, con:-1,sat:-1,shp:0,wb:0},
+  {n:'Noir',     i:'&#127761;',fx:2,br:0, con:2, sat:0, shp:1,wb:0},
+  {n:'Sketch',   i:'&#9999;',  fx:2,br:0, con:2, sat:0, shp:3,wb:0},
+  {n:'Sepia',    i:'&#128220;',fx:6,br:0, con:0, sat:0, shp:0,wb:0},
+  {n:'Negative', i:'&#11035;', fx:1,br:0, con:0, sat:0, shp:0,wb:0},
+  {n:'Warm',     i:'&#128262;',fx:0,br:0, con:0, sat:1, shp:0,wb:1},
+  {n:'Cool',     i:'&#10052;', fx:0,br:0, con:0, sat:1, shp:0,wb:2},
+  {n:'Fade',     i:'&#127749;',fx:0,br:1, con:-1,sat:-1,shp:0,wb:0},
+  {n:'Portrait', i:'&#128100;',fx:0,br:0, con:0, sat:1, shp:1,wb:1},
+  {n:'Red',      i:'&#128308;',fx:3,br:0, con:0, sat:0, shp:0,wb:0},
+  {n:'Green',    i:'&#128994;',fx:4,br:0, con:0, sat:0, shp:0,wb:0},
+  {n:'Blue',     i:'&#128309;',fx:5,br:0, con:0, sat:0, shp:0,wb:0},
+  {n:'Night',    i:'&#127769;',fx:0,br:2, con:1, sat:0, shp:0,wb:0},
+];
+(()=>{const g=document.getElementById('fgrid');
+  PRESETS.forEach((p,i)=>{const b=document.createElement('button');
+    b.className='fp'+(i===0?' on':'');
+    b.innerHTML='<span class="fi">'+p.i+'</span>'+p.n;
+    b.onclick=()=>applyPreset(p,b); g.appendChild(b);});})();
+
+async function applyPreset(p,btn){
+  document.querySelectorAll('.fp').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+  ['br','con','sat','shp'].forEach(k=>{
+    const el=document.getElementById(k);
+    if(el){el.value=p[k];document.getElementById(k+'v').textContent=p[k];}});
+  document.getElementById('wb').value=p.wb;
+  try{
+    await fetch('/settings?br='+p.br+'&con='+p.con+'&sat='+p.sat+'&shp='+p.shp+'&wb='+p.wb+'&fx='+p.fx);
+    st('&#10024; '+p.n+' applied','ok'); setTimeout(()=>st(''),2500);
+  }catch(e){st('&#10060; '+e.message,'err');}
+}
+
+async function set(k,v){try{await fetch('/settings?'+k+'='+v);}catch(e){}}
+function sl(k,el){document.getElementById(k+'v').textContent=el.value;set(k,el.value)}
+function tog(k,btn){togState[k]=togState[k]?0:1;btn.classList.toggle('on',!!togState[k]);set(k,togState[k])}
+
+async function captureBlob(){
+  st('<span class="spin"></span>Capturing&hellip;','busy');
+  const r=await fetch('/photo?t='+Date.now());
+  if(!r.ok) throw new Error('Capture failed');
+  lastNum=parseInt(r.headers.get('X-Photo-Num')||'0');
+  const blob=await r.blob();
+  const img=document.getElementById('prev');
+  if(img.src&&img.src.startsWith('blob:'))URL.revokeObjectURL(img.src);
+  img.src=URL.createObjectURL(blob); img.style.display='block';
+  return blob;
+}
+async function sendTg(blob,num){
+  const fd=new FormData();
+  fd.append('chat_id',CFG.chat);
+  fd.append('caption','KewlCam #'+num);
+  fd.append('photo',blob,'kewlcam_'+num+'.jpg');
+  const res=await fetch(tgUrl(),{method:'POST',body:fd});
+  const j=await res.json();
+  if(!j.ok) throw new Error('Telegram: '+(j.description||'error'));
+}
+async function shareWa(blob){
+  const f=new File([blob],'kewlcam.jpg',{type:'image/jpeg'});
+  if(navigator.canShare&&navigator.canShare({files:[f]})){
+    st('<span class="spin"></span>Opening share&hellip;','busy');
+    await navigator.share({files:[f],title:'KewlCam',text:'KewlCam #'+lastNum});
+    st('&#9989; Shared!','ok');
+  }else{
+    const url=URL.createObjectURL(blob),a=document.createElement('a');
+    a.href=url;a.download='kewlcam.jpg';document.body.appendChild(a);
+    a.click();a.remove();URL.revokeObjectURL(url);
+    st('&#128229; Downloaded','ok');
+  }
+}
+async function go(target){
+  if(busy)return; lock(true);
+  try{
+    const blob=await captureBlob();
+    // The photo is already on the card AND queued. If we deliver it here we
+    // clear the marker; if anything goes wrong we simply leave it queued and
+    // the camera sends it itself.
+    if(target==='wa'){await shareWa(blob); await fetch('/sent?n='+lastNum);}
+    else{
+      st('<span class="spin"></span>Sending to Telegram&hellip;','busy');
+      try{
+        await sendTg(blob,lastNum);
+        await fetch('/sent?n='+lastNum);
+        st('&#9989; Sent! Photo #'+lastNum,'ok');
+      }catch(e){
+        st('&#128190; On SD &amp; queued — camera will send it: '+e.message,'err');
+      }
+    }
+  }catch(e){
+    const m=e.message||String(e);
+    if(m.includes('abort')||m.includes('cancel')) st('Cancelled','');
+    else st('&#10060; '+m,'err');
+  }
+  lock(false); setTimeout(()=>st(''),6000);
+}
+
+// Relay queued photos over the phone's data when the camera has no internet.
+async function drain(list){
+  if(draining||busy||!list.length||Date.now()<relayHold)return; draining=true;
+  for(const n of list){
+    try{
+      st('<span class="spin"></span>Relaying #'+n+'&hellip;','busy');
+      const fr=await fetch('/file?n='+n);
+      if(fr.status===404){await fetch('/sent?n='+n);continue;}
+      if(!fr.ok)break;
+      await sendTg(await fr.blob(),n);
+      await fetch('/sent?n='+n);
+      st('&#9989; Relayed #'+n,'ok');
+    }catch(e){
+      // This phone has no working path to Telegram either — back off so we
+      // stop holding the camera's own uploader off the queue.
+      relayHold=Date.now()+60000;
+      st('&#10060; Relay failed (retrying in 60 s): '+(e.message||e),'err');
+      break;
+    }
+  }
+  draining=false;
+}
+
+function fmtUp(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
+  return (d?d+'d ':'')+(h||d?h+'h ':'')+m+'m';}
+
+async function poll(){
+  if(busy)return;
+  try{
+    const d=await(await fetch('/status')).json();
+    document.getElementById('k_sd').textContent = d.sd? 'OK':'NOT MOUNTED';
+    document.getElementById('k_wifi').textContent = d.wifi? d.ssid+' ('+d.rssi+' dBm)':'offline';
+    document.getElementById('k_n').textContent  = d.shot+' taken · #'+d.last;
+    document.getElementById('k_q').textContent  = d.pending;
+    document.getElementById('k_up').textContent = fmtUp(d.up);
+    document.getElementById('k_heap').textContent = (d.heap/1024).toFixed(0)+' KB';
+    document.getElementById('k_use').textContent = d.used+' / '+d.total+' MB';
+    document.getElementById('k_cnt').textContent = d.sent+' / '+d.shot;
+    document.getElementById('k_ip').textContent = d.ip;
+    document.getElementById('sub').textContent = 'ESP32-CAM · '+(d.wifi?d.ip:'AP mode');
+    document.getElementById('offmsg').style.display = (d.offload&&d.pending)?'block':'none';
+    if(d.offload&&d.pending) drain(d.list||[]);
+    if(d.cam&&!window._synced){window._synced=1;syncUI(d.cam);}
+  }catch(e){}
+}
+function syncUI(c){
+  const m={br:'brightness',con:'contrast',sat:'sat',shp:'sharpness',q:'quality',fd:'flash_duty'};
+  for(const k in m){const el=document.getElementById(k);
+    if(el){el.value=c[m[k]];document.getElementById(k+'v').textContent=c[m[k]];}}
+  document.getElementById('wb').value=c.wb_mode;
+  document.getElementById('res').value=c.res_idx;
+  [['hm','hmirror','thm'],['vf','vflip','tvf'],['fl','flash','tfl']].forEach(([k,f,id])=>{
+    togState[k]=c[f]?1:0;document.getElementById(id).classList.toggle('on',!!c[f]);});
+}
+async function loadGal(){
+  try{
+    const d=await(await fetch('/list?n=9')).json();
+    document.getElementById('gal').innerHTML =
+      d.list.map(n=>'<a href="/file?n='+n+'" target="_blank"><img loading="lazy" src="/file?n='+n+'"></a>').join('');
+  }catch(e){}
+}
+async function loadWifi(){
+  const d=await(await fetch('/wifi')).json();
+  document.getElementById('wrows').innerHTML = d.nets.map((w,i)=>
+    '<div class="srow"><label>SSID '+(i+1)+'</label>'+
+    '<input type="text" id="ws'+i+'" value="'+w.ssid.replace(/"/g,'&quot;')+'" placeholder="(unused)"></div>'+
+    '<div class="srow"><label>Pass '+(i+1)+'</label>'+
+    '<input type="password" id="wp'+i+'" placeholder="'+(w.set?'(unchanged)':'(none)')+'"></div>').join('');
+}
+async function saveWifi(){
+  const p=new URLSearchParams();
+  for(let i=0;i<3;i++){
+    p.append('s'+i,document.getElementById('ws'+i).value);
+    const pw=document.getElementById('wp'+i).value;
+    if(pw) p.append('p'+i,pw);
+  }
+  st('<span class="spin"></span>Saving&hellip;','busy');
+  await fetch('/wifi?'+p.toString(),{method:'POST'});
+  st('&#9989; Saved — rebooting','ok');
+}
+async function retry(){await fetch('/retry');st('&#9993; Retrying queue&hellip;','busy');}
+
+async function doScan(){
+  st('<span class="spin"></span>Scanning&hellip;','busy');
+  for(let i=0;i<12;i++){
+    const d=await(await fetch('/scan')).json();
+    if(!d.scanning){
+      if(!d.nets.length){st('No networks found','err');return;}
+      d.nets.sort((a,b)=>b.r-a.r);
+      document.getElementById('scanlist').innerHTML =
+        d.nets.map(w=>'<button class="fp" onclick="pick(this.dataset.s)" data-s="'+
+          w.s.replace(/"/g,'&quot;')+'">'+w.s.replace(/</g,'&lt;')+
+          ' &middot; '+w.r+' dBm</button>').join('');
+      st('&#9989; Tap a network to fill a slot','ok');
+      return;
+    }
+    await new Promise(r=>setTimeout(r,700));
+  }
+  st('Scan timed out','err');
+}
+function pick(ssid){
+  // First empty slot wins; otherwise overwrite the last one.
+  let slot=2;
+  for(let i=0;i<3;i++){ if(!document.getElementById('ws'+i).value){slot=i;break;} }
+  document.getElementById('ws'+slot).value=ssid;
+  document.getElementById('wp'+slot).focus();
+  st('&#128272; "'+ssid+'" &rarr; slot '+(slot+1)+' — type the password, then Save','ok');
+}
+
+(async()=>{
+  try{CFG=await(await fetch('/config.json')).json();}catch(e){}
+  loadWifi(); loadGal(); poll();
+  setInterval(poll,2000);
+})();
+</script>
+</body></html>
+)rawliteral";
+
+/*═══════════════════════════════════════════════════════════════════════╗
+║  5. NVS-backed counters and settings                                   ║
+╚═══════════════════════════════════════════════════════════════════════*/
+
+static void prefsLoad() {
+  prefs.begin("kewlcam", false);
+  g_nextNum   = prefs.getUInt("next", 1);
+  g_oldestNum = prefs.getUInt("oldest", 1);
+  g_sentTotal = prefs.getUInt("sent", 0);
+#if BOT_COMMANDS
+  g_tgOffset = prefs.getLong64("tgoff", 0);
+  g_tgOffsetInit = (g_tgOffset != 0);   // known offset survives a reboot
+#endif
+  size_t sz = prefs.getBytesLength("cam");
+  if (sz == sizeof(CamCfg)) prefs.getBytes("cam", &g_cam, sizeof(CamCfg));
+  for (int i = 0; i < 3; i++) {
+    char ks[8], kp[8];
+    snprintf(ks, sizeof ks, "s%d", i);
+    snprintf(kp, sizeof kp, "p%d", i);
+    String s = prefs.getString(ks, "");
+    if (s.length()) {
+      strlcpy(g_ssid[i], s.c_str(), sizeof g_ssid[i]);
+      strlcpy(g_pass[i], prefs.getString(kp, "").c_str(), sizeof g_pass[i]);
+    }
+  }
+}
+static void prefsSaveCounters() {
+  if (!xSemaphoreTake(g_nvsMux, pdMS_TO_TICKS(2000))) return;
+  prefs.putUInt("next", g_nextNum);
+  prefs.putUInt("oldest", g_oldestNum);
+  prefs.putUInt("sent", g_sentTotal);
+  xSemaphoreGive(g_nvsMux);
+}
+static void prefsSaveCam() {
+  if (!xSemaphoreTake(g_nvsMux, pdMS_TO_TICKS(2000))) return;
+  prefs.putBytes("cam", &g_cam, sizeof(CamCfg));
+  xSemaphoreGive(g_nvsMux);
+}
+
+/*═══════════════════════════════════════════════════════════════════════╗
+║  6. SD card — mount, paths, queue markers, recycling                   ║
+╚═══════════════════════════════════════════════════════════════════════*/
+
+static void photoPath(char* b, size_t n, uint32_t num) {
+  snprintf(b, n, "/DCIM/IMG_%05lu.JPG", (unsigned long)num);
+}
+static void queuePath(char* b, size_t n, uint32_t num) {
+  snprintf(b, n, "/QUEUE/%05lu", (unsigned long)num);
+}
+
+static void IRAM_ATTR btnISR();
+static bool s_btnArmed = false;
+
+// GPIO 13 is SD DAT3 — unused in 1-bit mode, but a (re)mount reconfigures it
+// and would quietly disarm the shutter. Take the pin back after every mount.
+static void restoreButtonPin() {
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  if (s_btnArmed) attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), btnISR, FALLING);
+}
+
+// GPIO 4 doubles as SD DAT1. In 1-bit mode it is unused, but the driver
+// leaves a pull-up on it that makes the flash LED glow. Reclaim it for PWM.
+static void reclaimFlashPin() {
+  static bool attached = false;
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  if (attached) ledcDetach(FLASH_PIN);   // remounts re-apply the pull-up
+#endif
+  gpio_reset_pin((gpio_num_t)FLASH_PIN);
+  gpio_set_pull_mode((gpio_num_t)FLASH_PIN, GPIO_FLOATING);
+  attached = true;
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(FLASH_PIN, 5000, 8);
+#else
+  ledcSetup(FLASH_LEDC_CH, 5000, 8);
+  ledcAttachPin(FLASH_PIN, FLASH_LEDC_CH);
+#endif
+  FLASH_WRITE(0);
+}
+
+static bool sdMount() {
+  for (int attempt = 0; attempt < 3; attempt++) {
+    SD_MMC.end();
+    delay(50);
+    // 1-bit mode: uses only GPIO 14/15/2, leaving GPIO 4 (flash) and
+    // GPIO 13 (button) free. 4-bit would be faster but takes both.
+    // 20 MHz (SDMMC_FREQ_DEFAULT) rather than the 40 MHz the core defaults to
+    // — kinder to the ESP32-CAM's traces. maxOpenFiles 3, not 5: each slot is
+    // a FATFS sector buffer in the internal DRAM we are short of.
+    if (SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT, 3)) {
+      uint8_t t = SD_MMC.cardType();
+      if (t != CARD_NONE) {
+        SD_MMC.mkdir("/DCIM");
+        SD_MMC.mkdir("/QUEUE");
+        Serial.printf("[SD]  mounted, %llu MB, type %d\n",
+                      SD_MMC.cardSize() / (1024ULL * 1024ULL), t);
+        reclaimFlashPin();
+        restoreButtonPin();
+        return true;
+      }
+    }
+    Serial.printf("[SD]  mount attempt %d failed\n", attempt + 1);
+    delay(300);
+  }
+  reclaimFlashPin();
+  restoreButtonPin();
+  return false;
+}
+
+// One directory walk serves all three questions the queue is ever asked:
+// how many, which is oldest, and give me the next few.
+static uint32_t queueScan(uint32_t* firstOut, uint32_t skip,
+                          uint32_t* batch, int batchMax, int* batchN) {
+  if (firstOut) *firstOut = 0;
+  if (batchN)   *batchN   = 0;
+  if (!g_sdOK) return 0;
+  if (!SD_LOCK(4000)) return g_pending;
+
+  uint32_t count = 0, best = 0;
+  File d = SD_MMC.open("/QUEUE");
+  if (d) {
+    File f;
+    while ((f = d.openNextFile())) {
+      const char* nm = f.name();
+      const char* slash = strrchr(nm, '/');
+      if (slash) nm = slash + 1;
+      uint32_t v = strtoul(nm, nullptr, 10);
+      f.close();
+      if (!v) continue;
+      count++;
+      if (v != skip && (!best || v < best)) best = v;
+      if (batch && batchN && *batchN < batchMax) batch[(*batchN)++] = v;
+    }
+    d.close();
+  }
+  SD_UNLOCK();
+  if (firstOut) *firstOut = best;
+  return count;
+}
+static inline uint32_t queueCount() { return queueScan(nullptr, 0, nullptr, 0, nullptr); }
+
+// Oldest queued photo that the browser has not claimed for itself.
+static inline uint32_t queueFirstSendable() {
+  uint32_t skip = (millis() < g_claimUntil) ? g_claimNum : 0;
+  uint32_t f;
+  queueScan(&f, skip, nullptr, 0, nullptr);
+  return f;
+}
+
+static void queueAdd(uint32_t num) {
+  if (!g_sdOK) return;
+  if (!SD_LOCK(4000)) return;
+  char p[40]; queuePath(p, sizeof p, num);
+  File f = SD_MMC.open(p, FILE_WRITE);
+  if (f) f.close();
+  SD_UNLOCK();
+  g_pending = queueCount();
+}
+static void queueRemove(uint32_t num) {
+  if (!g_sdOK) return;
+  if (!SD_LOCK(4000)) return;
+  char p[40]; queuePath(p, sizeof p, num);
+  SD_MMC.remove(p);
+  SD_UNLOCK();
+  g_pending = queueCount();
+}
+
+// Never fail a capture because the card is full: recycle the oldest photos.
+static void sdPruneIfNeeded() {
+  if (!g_sdOK) return;
+  uint64_t total = SD_MMC.totalBytes();
+  uint64_t used  = SD_MMC.usedBytes();
+  if (!total) return;
+  int guard = 0;
+  while ((total - used) < (uint64_t)SD_MIN_FREE_MB * 1024ULL * 1024ULL &&
+         g_oldestNum + 1 < g_nextNum && guard++ < 20) {
+    for (int i = 0; i < 25 && g_oldestNum + 1 < g_nextNum; i++) {
+      char p[40]; photoPath(p, sizeof p, g_oldestNum);
+      SD_MMC.remove(p);
+      g_oldestNum++;
+    }
+    prefsSaveCounters();
+    used = SD_MMC.usedBytes();   // re-measured per batch, it is not cheap
+  }
+}
+
+static bool sdWritePhoto(uint32_t num, const uint8_t* buf, size_t len) {
+  if (!g_sdOK) return false;
+  if (!SD_LOCK(8000)) return false;
+  bool ok = false;
+  for (int attempt = 0; attempt < 2 && !ok; attempt++) {
+    char p[40]; photoPath(p, sizeof p, num);
+    File f = SD_MMC.open(p, FILE_WRITE);
+    if (f) {
+      ok = (f.write(buf, len) == len);
+      f.close();
+      if (!ok) SD_MMC.remove(p);
+    }
+    if (!ok) {                       // card hiccup → remount and try once more
+      Serial.println("[SD]  write failed, remounting");
+      g_sdOK = sdMount();
+      if (!g_sdOK) break;
+      sdPruneIfNeeded();
+    }
+  }
+  if (ok && (num % PRUNE_EVERY) == 0) sdPruneIfNeeded();
+  SD_UNLOCK();
+  return ok;
+}
+
+/*═══════════════════════════════════════════════════════════════════════╗
+║  7. Camera                                                             ║
+╚═══════════════════════════════════════════════════════════════════════*/
+
+static void applySettings() {
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) return;
+  s->set_brightness(s,     g_cam.brightness);
+  s->set_contrast(s,       g_cam.contrast);
+  s->set_saturation(s,     g_cam.sat);
+  s->set_sharpness(s,      g_cam.sharpness);
+  s->set_wb_mode(s,        g_cam.wb_mode);
+  s->set_hmirror(s,        g_cam.hmirror);
+  s->set_vflip(s,          g_cam.vflip);
+  s->set_quality(s,        g_cam.quality);
+  s->set_special_effect(s, g_cam.effect);
+  s->set_framesize(s,      FRAMESIZES[constrain(g_cam.res_idx, 0, 5)]);
+}
+
+static bool initCamera() {
+  camera_config_t c = {};
+  c.ledc_channel = LEDC_CHANNEL_0; c.ledc_timer = LEDC_TIMER_0;
+  c.pin_d0=Y2_GPIO_NUM; c.pin_d1=Y3_GPIO_NUM; c.pin_d2=Y4_GPIO_NUM; c.pin_d3=Y5_GPIO_NUM;
+  c.pin_d4=Y6_GPIO_NUM; c.pin_d5=Y7_GPIO_NUM; c.pin_d6=Y8_GPIO_NUM; c.pin_d7=Y9_GPIO_NUM;
+  c.pin_xclk=XCLK_GPIO_NUM; c.pin_pclk=PCLK_GPIO_NUM;
+  c.pin_vsync=VSYNC_GPIO_NUM; c.pin_href=HREF_GPIO_NUM;
+  c.pin_sccb_sda=SIOD_GPIO_NUM; c.pin_sccb_scl=SIOC_GPIO_NUM;
+  c.pin_pwdn=PWDN_GPIO_NUM; c.pin_reset=RESET_GPIO_NUM;
+  c.xclk_freq_hz=20000000; c.pixel_format=PIXFORMAT_JPEG;
+
+  if (psramFound()) {
+    // Allocate for the resolution actually in use, NOT for UXGA. Reserving
+    // the maximum cost tens of KB of internal DRAM in DMA/line buffers even
+    // with the frames themselves in PSRAM, and that shortage is what starves
+    // mbedtls and makes socket() fail. Changing resolution re-inits instead.
+    c.frame_size    = FRAMESIZES[constrain(g_cam.res_idx, 0, 5)];
+    c.jpeg_quality  = constrain(g_cam.quality, 6, 30);
+    c.fb_count      = 2;             // free-running DMA: fb_get returns an
+    c.fb_location   = CAMERA_FB_IN_PSRAM;
+    c.grab_mode     = CAMERA_GRAB_LATEST;   // already-exposed frame instantly
+  } else {
+    c.frame_size    = FRAMESIZE_SVGA;
+    c.jpeg_quality  = 12;
+    c.fb_count      = 1;
+    c.fb_location   = CAMERA_FB_IN_DRAM;
+    c.grab_mode     = CAMERA_GRAB_WHEN_EMPTY;
+  }
+
+  for (int attempt = 0; attempt < 3; attempt++) {
+    esp_err_t e = esp_camera_init(&c);
+    if (e == ESP_OK) {
+      applySettings();
+      Serial.printf("[CAM] init ok at res_idx=%d, heap=%luK psram=%luK\n",
+                    g_cam.res_idx, (unsigned long)(ESP.getFreeHeap() / 1024),
+                    (unsigned long)(ESP.getFreePsram() / 1024));
+      return true;
+    }
+    Serial.printf("[CAM] init failed (0x%x), retry %d\n", e, attempt + 1);
+    esp_camera_deinit();
+    delay(400);
+  }
+  return false;
+}
+
+// Resolution changes now re-init rather than pre-reserving the largest frame.
+// Costs ~300 ms on change, saves internal DRAM permanently.
+static bool reinitCamera() {
+  esp_camera_deinit();
+  delay(120);
+  g_camOK = initCamera();
+  return g_camOK;
+}
+
+static uint32_t claimPhotoNumber() {
+  uint32_t n;
+  xSemaphoreTake(g_nvsMux, portMAX_DELAY);
+  n = g_nextNum++;
+  prefs.putUInt("next", g_nextNum);
+  xSemaphoreGive(g_nvsMux);
+  return n;
+}
+
+/*
+  The one function that matters: grab a frame and get it onto the card.
+  Network work never happens here — it is handed to netTask afterwards.
+  Returns the photo number in *outNum (0 on total failure).
+*/
+static bool captureAndStore(uint32_t* outNum, bool queueForSend) {
+  *outNum = 0;
+  if (!g_camOK) return false;
+  if (!xSemaphoreTake(g_camMux, pdMS_TO_TICKS(6000))) return false;
+  g_busyCapture = true;
+
+  bool useFlash = g_cam.flash && g_cam.flash_duty > 0;
+  if (useFlash) {
+    FLASH_WRITE(g_cam.flash_duty);
+    // Drop the frames that were exposed before the LED came on.
+    for (int i = 0; i < FLASH_SETTLE_FRAMES; i++) {
+      camera_fb_t* d = esp_camera_fb_get();
+      if (d) esp_camera_fb_return(d);
+    }
+  }
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (useFlash) FLASH_WRITE(0);      // LED off before the SD write draws current
+
+  if (!fb || !fb->len) {
+    if (fb) esp_camera_fb_return(fb);
+    g_camFails++;
+    g_busyCapture = false;
+    xSemaphoreGive(g_camMux);
+    Serial.println("[CAM] capture failed");
+    return false;
+  }
+  g_camFails = 0;
+
+  uint32_t num = claimPhotoNumber();
+  bool ok = sdWritePhoto(num, fb->buf, fb->len);
+
+  if (!ok) {
+    // Card missing or dead — keep this shot in PSRAM so it is not simply lost.
+    g_sdFails++;
+    if (g_ramBuf) { free(g_ramBuf); g_ramBuf = nullptr; g_ramLen = 0; }
+    g_ramBuf = (uint8_t*)ps_malloc(fb->len);
+    if (!g_ramBuf) g_ramBuf = (uint8_t*)malloc(fb->len);
+    if (g_ramBuf) { memcpy(g_ramBuf, fb->buf, fb->len); g_ramLen = fb->len; g_ramNum = num; }
+  }
+
+  g_lastNum = num;
+  g_lastLen = fb->len;
+  g_shotTotal++;
+  esp_camera_fb_return(fb);
+  g_busyCapture = false;
+  xSemaphoreGive(g_camMux);
+
+  // Only queue a marker for a photo that actually reached the card — otherwise
+  // the marker points at nothing and the uploader has to throw it away. When
+  // the write failed the PSRAM fallback above carries the shot instead.
+  if (queueForSend && ok) queueAdd(num);
+  *outNum = num;
+  Serial.printf("[CAM] #%lu  %lu B  sd=%d  heap=%lu\n",
+                (unsigned long)num, (unsigned long)g_lastLen, ok,
+                (unsigned long)ESP.getFreeHeap());
+  return true;
+}
+
+/*═══════════════════════════════════════════════════════════════════════╗
+║  8. Button — ISR straight to a dedicated task                          ║
+╚═══════════════════════════════════════════════════════════════════════*/
+
+// IRAM_ATTR lives on the forward declaration above; repeating it here would
+// emit a second .iram1 section and warn.
+static void btnISR() {
+  uint32_t now = millis();
+  if (now - g_btnIsrMs < BTN_LOCKOUT_MS) return;   // bounce / double-shot guard
+  g_btnIsrMs = now;
+  BaseType_t hpw = pdFALSE;
+  vTaskNotifyGiveFromISR(g_camTask, &hpw);
+  if (hpw) portYIELD_FROM_ISR();
+}
+
+static void camTaskFn(void*) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    // Confirm the line is genuinely held — rejects EMI spikes on a long wire
+    // without costing anything a human could feel.
+    vTaskDelay(pdMS_TO_TICKS(BTN_CONFIRM_MS));
+    if (digitalRead(BUTTON_PIN) != LOW) continue;
+
+    ledSet(true);                       // instant feedback the moment it fires
+    uint32_t num = 0;
+    bool ok = captureAndStore(&num, true);
+    ledSet(false);
+    blink(ok ? 1 : 5);
+    g_lastActivity = millis();
+    if (ok) xTaskNotifyGive(g_netTask); // wake the uploader, do not wait for it
+  }
+}
+
+/*═══════════════════════════════════════════════════════════════════════╗
+║  9. Telegram — streamed from the card, never buffered whole in RAM     ║
+╚═══════════════════════════════════════════════════════════════════════*/
+
+static void captionFor(char* out, size_t n, uint32_t num) {
+  if (g_timeOK) {
+    time_t t = time(nullptr);
+    struct tm tm; localtime_r(&t, &tm);
+    char ts[32];
+    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M", &tm);
+    snprintf(out, n, "KewlCam #%lu  %s", (unsigned long)num, ts);
+  } else {
+    snprintf(out, n, "KewlCam #%lu", (unsigned long)num);
+  }
+}
+
+/*
+  One TLS session, reused across a whole drain burst. The handshake to
+  api.telegram.org costs 1-2 s on this chip; paying it per photo was most of
+  what made the queue feel slow. Only netTask ever touches g_tg, so no mutex.
+*/
+static WiFiClientSecure g_tg;
+static uint32_t g_tgIdleSince = 0;
+
+static bool tgConnect() {
+  if (g_tg.connected()) return true;
+  g_tg.stop();
+  g_tg.setInsecure();
+  g_tg.setTimeout(12);
+  uint32_t t0 = millis();
+  bool ok = g_tg.connect("api.telegram.org", 443, 12000);
+  Serial.printf("[TG]  handshake %s (%lu ms)\n",
+                ok ? "ok" : "FAILED", (unsigned long)(millis() - t0));
+  return ok;
+}
+static void tgClose() { g_tg.stop(); }
+
+/*
+  Reads the status line, the headers, then exactly Content-Length body bytes,
+  so the socket is left positioned at the next response and can be reused.
+  Anything we cannot account for exactly → *reusable = false and the caller
+  drops the connection rather than risk desyncing the next request.
+*/
+static bool tgReadReply(bool* reusable, String* bodyOut = nullptr,
+                        bool abortOnQueue = false) {
+  *reusable = false;
+  const size_t cap = bodyOut ? 1600 : 240;
+  uint32_t t0 = millis();
+  uint32_t limit = abortOnQueue ? (BOT_POLL_SECONDS + 12) * 1000UL : 20000UL;
+  String line; line.reserve(96);
+  long clen = -1;
+  bool chunked = false, headersDone = false;
+
+  while (millis() - t0 < limit) {
+    if (!g_tg.available()) {
+      if (!g_tg.connected()) return false;
+      // A photo just landed in the queue — stop waiting on a long poll and go
+      // deliver it. The socket is mid-response, so it cannot be reused.
+      if (abortOnQueue && g_pending) { g_tg.stop(); return false; }
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+    char ch = (char)g_tg.read();
+    if (ch == '\r') continue;
+    if (ch != '\n') { if (line.length() < 90) line += ch; continue; }
+    if (line.length() == 0) { headersDone = true; break; }
+    String lc = line; lc.toLowerCase();
+    if (lc.startsWith("content-length:")) clen = lc.substring(15).toInt();
+    else if (lc.startsWith("transfer-encoding:") && lc.indexOf("chunked") >= 0) chunked = true;
+    line = "";
+  }
+  if (!headersDone) return false;
+
+  String body; body.reserve(cap > 512 ? 512 : cap);
+  if (clen >= 0 && !chunked) {
+    long left = clen;
+    while (left > 0 && millis() - t0 < limit) {
+      if (!g_tg.available()) {
+        if (!g_tg.connected()) break;
+        vTaskDelay(pdMS_TO_TICKS(5));
+        continue;
+      }
+      // Every byte is consumed to keep the socket in sync; only the first
+      // `cap` are kept.
+      if (body.length() < cap) body += (char)g_tg.read(); else g_tg.read();
+      left--;
+    }
+    *reusable = (left == 0) && g_tg.connected();
+  } else {
+    while ((g_tg.connected() || g_tg.available()) && millis() - t0 < limit) {
+      while (g_tg.available()) {
+        char ch = (char)g_tg.read();
+        if (body.length() < cap) body += ch;
+      }
+      if (body.indexOf("\"ok\":") >= 0) break;
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+  }
+  if (bodyOut) *bodyOut = body;
+  if (body.indexOf("\"ok\":true") >= 0) return true;
+  if (body.length()) Serial.printf("[TG]  reply: %s\n", body.c_str());
+  return false;
+}
+
+static bool tgSend(uint32_t num, File* src, const uint8_t* mem, size_t memLen) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  size_t bodyLen = src ? src->size() : memLen;
+  if (!bodyLen || bodyLen > 9UL * 1024 * 1024) return false;
+
+  const char* bnd = "KCamBnd7f3a";
+  char cap[64]; captionFor(cap, sizeof cap, num);
+  char head[512];
+  int hl = snprintf(head, sizeof head,
+    "--%s\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n%s\r\n"
+    "--%s\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n%s\r\n"
+    "--%s\r\nContent-Disposition: form-data; name=\"photo\"; "
+    "filename=\"kewlcam_%05lu.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n",
+    bnd, CHAT_ID, bnd, cap, bnd, (unsigned long)num);
+  char tail[32];
+  int tl = snprintf(tail, sizeof tail, "\r\n--%s--\r\n", bnd);
+
+  // Two attempts: a reused socket the far end quietly dropped looks exactly
+  // like a failure, and costs one retry on a fresh one to tell apart.
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (!tgConnect()) return false;
+    if (src && !src->seek(0)) { tgClose(); return false; }
+    uint32_t t0 = millis();
+
+    bool wrote = true;
+    g_tg.printf("POST /bot%s/sendPhoto HTTP/1.1\r\n", BOT_TOKEN);
+    g_tg.print(F("Host: api.telegram.org\r\nConnection: keep-alive\r\n"));
+    g_tg.printf("Content-Type: multipart/form-data; boundary=%s\r\n", bnd);
+    g_tg.printf("Content-Length: %lu\r\n\r\n", (unsigned long)(hl + bodyLen + tl));
+    if (g_tg.write((const uint8_t*)head, hl) != (size_t)hl) wrote = false;
+
+    if (wrote && src) {
+      // From PSRAM, not DRAM and not the stack: internal memory is the scarce
+      // resource here and mbedtls needs every KB of it.
+      static uint8_t* buf = nullptr;
+      if (!buf) {
+        buf = (uint8_t*)ps_malloc(4096);
+        if (!buf) buf = (uint8_t*)malloc(4096);
+      }
+      if (!buf) { tgClose(); return false; }
+      const size_t bufSz = 4096;
+      size_t left = bodyLen;
+      while (left && wrote) {
+        // Released between chunks so a button press can still write to the
+        // card in the middle of a slow upload.
+        if (!SD_LOCK(4000)) { wrote = false; break; }
+        int r = src->read(buf, left < bufSz ? left : bufSz);
+        SD_UNLOCK();
+        if (r <= 0) { wrote = false; break; }
+        if (g_tg.write(buf, r) != (size_t)r) { wrote = false; break; }
+        left -= r;
+      }
+    } else if (wrote) {
+      size_t left = memLen, off = 0;
+      while (left) {
+        size_t chunk = left < 4096 ? left : 4096;
+        if (g_tg.write(mem + off, chunk) != chunk) { wrote = false; break; }
+        off += chunk; left -= chunk;
+      }
+    }
+    if (wrote && g_tg.write((const uint8_t*)tail, tl) != (size_t)tl) wrote = false;
+
+    bool reusable = false;
+    bool ok = wrote && tgReadReply(&reusable);
+    if (!reusable) tgClose();
+    g_tgIdleSince = millis();
+
+    if (ok) {
+      Serial.printf("[TG]  #%lu sent, %lu B in %lu ms%s\n",
+                    (unsigned long)num, (unsigned long)bodyLen,
+                    (unsigned long)(millis() - t0), reusable ? " (socket kept)" : "");
+      return true;
+    }
+    if (attempt == 0 && !reusable) continue;   // stale socket → one clean retry
+    Serial.printf("[TG]  #%lu FAILED\n", (unsigned long)num);
+    return false;
+  }
+  return false;
+}
+
+static void urlEncode(const char* in, char* out, size_t n) {
+  static const char* hex = "0123456789ABCDEF";
+  size_t o = 0;
+  for (const char* p = in; *p && o + 4 < n; p++) {
+    unsigned char c = (unsigned char)*p;
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out[o++] = c;
+    else { out[o++] = '%'; out[o++] = hex[c >> 4]; out[o++] = hex[c & 15]; }
+  }
+  out[o] = 0;
+}
+
+// Used to announce the camera's IP on boot, so finding the web UI never
+// depends on .local resolving.
+static bool tgSendText(const char* msg) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!tgConnect()) return false;
+  // Percent-encoding can triple the length (every space and newline becomes
+  // three bytes), so size for the worst case — the previous 320 was quietly
+  // cutting /status and the boot announcement short. Static because netTask
+  // is the only caller and the handshake wants the stack.
+  static char* enc = nullptr;
+  static char* body = nullptr;
+  if (!enc)  { enc  = (char*)ps_malloc(1700); if (!enc)  enc  = (char*)malloc(1700); }
+  if (!body) { body = (char*)ps_malloc(1800); if (!body) body = (char*)malloc(1800); }
+  if (!enc || !body) return false;
+  urlEncode(msg, enc, 1700);
+  int bl = snprintf(body, 1800, "chat_id=%s&text=%s", CHAT_ID, enc);
+  g_tg.printf("POST /bot%s/sendMessage HTTP/1.1\r\n", BOT_TOKEN);
+  g_tg.print(F("Host: api.telegram.org\r\nConnection: keep-alive\r\n"
+               "Content-Type: application/x-www-form-urlencoded\r\n"));
+  g_tg.printf("Content-Length: %d\r\n\r\n", bl);
+  g_tg.write((const uint8_t*)body, bl);
+  bool reusable = false;
+  bool ok = tgReadReply(&reusable);
+  if (!reusable) tgClose();
+  g_tgIdleSince = millis();
+  return ok;
+}
+
+#if BOT_COMMANDS
+/*═══════════════════════════════════════════════════════════════════════╗
+║  9b. Telegram bot commands                                             ║
+║                                                                        ║
+║  Long-polls getUpdates on the same TLS session the uploads use, so     ║
+║  there is only ever one connection. Asking for limit=1 keeps the       ║
+║  payload small and the parsing honest — no JSON library needed.        ║
+║  Because it works over the internet, a LAN that blocks inbound         ║
+║  connections stops mattering.                                          ║
+╚═══════════════════════════════════════════════════════════════════════*/
+
+static void apStart();     // these all live in section 10, below
+static void apStop();
+static bool webSelfTest(char* detail, size_t n);
+static int  scanForBest(int* bestRssi, char* bestSsid, size_t n);
+
+// Telegram chat ids exceed 32 bits, so this must not be a long.
+static int64_t jsonNum(const String& s, const char* key) {
+  int i = s.indexOf(key);
+  if (i < 0) return INT64_MIN;
+  i += strlen(key);
+  while (i < (int)s.length() && s[i] == ' ') i++;
+  return strtoll(s.c_str() + i, nullptr, 10);
+}
+// Finds `key` only after `scope` appears, so "id" inside "chat" is not
+// confused with the "id" inside "from". Tolerates spacing and key order.
+static int64_t jsonNumIn(const String& s, const char* scope, const char* key) {
+  int i = (scope && *scope) ? s.indexOf(scope) : 0;
+  if (i < 0) return INT64_MIN;
+  int j = s.indexOf(key, i);
+  if (j < 0) return INT64_MIN;
+  j += strlen(key);
+  while (j < (int)s.length() && (s[j] == ' ' || s[j] == ':')) j++;
+  if (j >= (int)s.length()) return INT64_MIN;
+  return strtoll(s.c_str() + j, nullptr, 10);
+}
+// `key` is the bare quoted name, e.g. "\"text\"" — the separator and any
+// spacing around it are skipped here rather than baked into the search.
+static String jsonStr(const String& s, const char* key) {
+  int i = s.indexOf(key);
+  if (i < 0) return String();
+  i += strlen(key);
+  while (i < (int)s.length() && (s[i] == ' ' || s[i] == ':')) i++;
+  if (i >= (int)s.length() || s[i] != '"') return String();
+  i++;
+  String out;
+  bool esc = false;
+  for (; i < (int)s.length() && out.length() < 120; i++) {
+    char c = s[i];
+    if (esc) { out += (c == 'n' ? '\n' : c); esc = false; continue; }
+    if (c == '\\') { esc = true; continue; }
+    if (c == '"') break;
+    out += c;
+  }
+  return out;
+}
+
+static void tgSaveOffset() {
+  if (!xSemaphoreTake(g_nvsMux, pdMS_TO_TICKS(2000))) return;
+  prefs.putLong64("tgoff", g_tgOffset);
+  xSemaphoreGive(g_nvsMux);
+}
+
+static void tgCmdStatus() {
+  char msg[320];
+  uint32_t up = millis() / 1000;
+  snprintf(msg, sizeof msg,
+    "KewlCam status\n"
+    "Net: %s (%d dBm)\nWeb: http://%s/\n"
+    "SD: %s  %lu/%lu MB\n"
+    "Photos: %lu taken, %lu sent, %lu queued\n"
+    "Flash: %s\nUptime: %luh %lum\nHeap: %lu KB\nWiFi drops: %lu",
+    WiFi.SSID().c_str(), WiFi.RSSI(), WiFi.localIP().toString().c_str(),
+    g_sdOK ? "ok" : "FAILED",
+    (unsigned long)(g_sdOK ? SD_MMC.usedBytes() / (1024ULL * 1024ULL) : 0),
+    (unsigned long)(g_sdOK ? SD_MMC.totalBytes() / (1024ULL * 1024ULL) : 0),
+    (unsigned long)g_shotTotal, (unsigned long)g_sentTotal, (unsigned long)g_pending,
+    g_cam.flash ? "on" : "off",
+    (unsigned long)(up / 3600), (unsigned long)((up % 3600) / 60),
+    (unsigned long)(ESP.getFreeHeap() / 1024), (unsigned long)g_wifiDrops);
+  tgSendText(msg);
+}
+
+// Returns true if a command was acted on (caller should re-run the drain).
+static bool tgRunCommand(const String& text) {
+  String c = text;
+  c.trim();
+  int sp = c.indexOf(' ');
+  String verb = (sp < 0) ? c : c.substring(0, sp);
+  String arg  = (sp < 0) ? String() : c.substring(sp + 1);
+  verb.toLowerCase();
+  arg.trim(); arg.toLowerCase();
+  int at = verb.indexOf('@');            // "/photo@KewlCamBot" in groups
+  if (at >= 0) verb = verb.substring(0, at);
+
+  if (verb == "/photo" || verb == "/p" || verb == "/pic" || verb == "/shoot") {
+    uint32_t num = 0;
+    blink(1);
+    if (captureAndStore(&num, true)) {
+      Serial.printf("[BOT] /photo -> #%lu\n", (unsigned long)num);
+      return true;                        // the drain loop delivers it
+    }
+    tgSendText("Capture failed - camera did not return a frame.");
+    return false;
+  }
+  if (verb == "/status" || verb == "/s") { tgCmdStatus(); return false; }
+  if (verb == "/networks" || verb == "/net") {
+    int best; char bs[33] = {0};
+    int idx = scanForBest(&best, bs, sizeof bs);
+    char m[300];
+    if (idx < 0) {
+      snprintf(m, sizeof m, "Scan found none of your saved networks in range.");
+    } else {
+      snprintf(m, sizeof m,
+               "Currently on: %s (%d dBm)\nStrongest saved: %s (%d dBm)\n\n%s",
+               WiFi.SSID().c_str(), WiFi.RSSI(), bs, best,
+               best > WiFi.RSSI() + ROAM_MARGIN_DBM
+                 ? "A better network is in range - the camera will move to it."
+                 : "Already on the best one available here.");
+    }
+    tgSendText(m);
+    return false;
+  }
+  if (verb == "/selftest" || verb == "/test") {
+    char st[80], m[420];
+    bool ok = webSelfTest(st, sizeof st);
+    snprintf(m, sizeof m,
+             "Web server self-test: %s\n%s\nAddress: http://%s/\n\n%s",
+             ok ? "PASS" : "FAIL", st, WiFi.localIP().toString().c_str(),
+             ok ? "The camera is serving pages on that address. A device that "
+                  "still cannot load it is on another network, or the router "
+                  "is blocking device-to-device traffic."
+                : "The fault is inside the camera - send me this message.");
+    tgSendText(m);
+    return false;
+  }
+  if (verb == "/ap") {
+    char m[200];
+    if (arg == "off") {
+      g_apManual = false;
+      apStop();
+      tgSendText("AP off. Radio dedicated to the uplink.");
+    } else {
+      g_apManual = true;                 // survives the auto-shutdown check
+      apStart();
+      snprintf(m, sizeof m,
+               "AP on.\nSSID: %s\nPassword: %s\nThen open http://192.168.4.1/\n"
+               "Send /ap off when done - it shares the radio with the uplink.",
+               AP_SSID, (AP_PASS && strlen(AP_PASS) >= 8) ? AP_PASS : "(open)");
+      tgSendText(m);
+    }
+    return false;
+  }
+  if (verb == "/ip") {
+    // Everything needed to tell "different networks" from "same network but
+    // blocked": compare Network and Gateway with the phone's WiFi details.
+    char m[280];
+    snprintf(m, sizeof m,
+             "Web UI: http://%s/\n"
+             "Network: %s\nGateway: %s\nMask: %s\nMAC: %s\nSignal: %d dBm\n"
+             "AP: %s\n\n"
+             "If your phone's gateway differs, you are on a different network "
+             "and this address cannot reach the camera.",
+             WiFi.localIP().toString().c_str(),
+             WiFi.SSID().c_str(),
+             WiFi.gatewayIP().toString().c_str(),
+             WiFi.subnetMask().toString().c_str(),
+             WiFi.macAddress().c_str(),
+             WiFi.RSSI(),
+             g_apOn ? "on (192.168.4.1)" : "off - send /ap on");
+    tgSendText(m);
+    return false;
+  }
+  if (verb == "/flash") {
+    if (arg == "on")       g_cam.flash = 1;
+    else if (arg == "off") g_cam.flash = 0;
+    else                   g_cam.flash = !g_cam.flash;
+    prefsSaveCam();
+    tgSendText(g_cam.flash ? "Flash ON (adds ~150 ms to the shutter)"
+                           : "Flash OFF (fastest shutter)");
+    return false;
+  }
+  if (verb == "/last") {
+    if (!g_lastNum) { tgSendText("No photos taken yet."); return false; }
+    queueAdd(g_lastNum);
+    return true;
+  }
+  if (verb == "/retry") {
+    g_sendFails = 0; g_firstFailMs = 0; g_claimUntil = 0;
+    g_pending = queueCount();
+    char m[64];
+    snprintf(m, sizeof m, "Retrying %lu queued photo(s).", (unsigned long)g_pending);
+    tgSendText(m);
+    return true;
+  }
+  if (verb == "/help" || verb == "/start") {
+    tgSendText("KewlCam commands\n"
+               "/photo - take and send a photo\n"
+               "/last - resend the most recent photo\n"
+               "/status - card, network, queue, uptime\n"
+               "/flash on|off - toggle the LED\n"
+               "/retry - flush the pending queue\n"
+               "/ap on|off - turn the KewlCam hotspot on for the web UI\n"
+               "/networks - signal of every saved network here\n"
+               "/selftest - check the web server is really answering\n"
+               "/ip - web UI address");
+    return false;
+  }
+  return false;                            // not a command; ignore silently
+}
+
+// One long-poll cycle. Returns true if a command ran.
+static bool tgPollCommands() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!tgConnect()) return false;
+
+  char path[220];
+  if (!g_tgOffsetInit)
+    snprintf(path, sizeof path, "/bot%s/getUpdates?offset=-1&limit=1&timeout=0", BOT_TOKEN);
+  else
+    snprintf(path, sizeof path, "/bot%s/getUpdates?offset=%lld&limit=1&timeout=%d",
+             BOT_TOKEN, (long long)g_tgOffset, BOT_POLL_SECONDS);
+
+  g_tg.printf("GET %s HTTP/1.1\r\n", path);
+  g_tg.print(F("Host: api.telegram.org\r\nConnection: keep-alive\r\n\r\n"));
+
+  bool reusable = false;
+  String body;
+  bool ok = tgReadReply(&reusable, &body, true);
+  if (!reusable) tgClose();
+  g_tgIdleSince = millis();
+  if (!ok) return false;
+
+  int64_t uid = jsonNum(body, "\"update_id\":");
+  if (uid == INT64_MIN) return false;      // empty result, nothing waiting
+  g_tgOffset = uid + 1;
+  tgSaveOffset();
+
+  // First run ever: adopt the latest id without executing, so a backlog of
+  // old messages does not fire off a burst of photos.
+  if (!g_tgOffsetInit) {
+    g_tgOffsetInit = true;
+    Serial.printf("[BOT] listening, starting at update %lld\n", (long long)g_tgOffset);
+    return false;
+  }
+
+  int64_t from = jsonNumIn(body, "\"chat\"", "\"id\"");
+  if (String((long long)from) != String(CHAT_ID)) {
+    Serial.printf("[BOT] ignoring message from chat %lld\n", (long long)from);
+    return false;
+  }
+
+  // Drop anything that has been sitting on Telegram's servers while the
+  // camera was offline — acting on a two-hour-old /photo is just confusing.
+  int64_t date = jsonNum(body, "\"date\":");
+  if (g_timeOK && date != INT64_MIN) {
+    int64_t age = (int64_t)time(nullptr) - date;
+    if (age > 300) {
+      Serial.printf("[BOT] skipping stale command (%llds old)\n", (long long)age);
+      return false;
+    }
+  }
+
+  String text = jsonStr(body, "\"text\"");
+  if (!text.length()) return false;
+  Serial.printf("[BOT] command: %s\n", text.c_str());
+  g_lastActivity = millis();
+  return tgRunCommand(text);
+}
+#endif  // BOT_COMMANDS
+
+// 1 = delivered, 0 = try again later, -1 = the file is gone, stop retrying it.
+static int tgSendQueued(uint32_t num) {
+  char p[40]; photoPath(p, sizeof p, num);
+  if (!SD_LOCK(4000)) return 0;
+  File f = SD_MMC.open(p, FILE_READ);
+  SD_UNLOCK();
+  if (!f) {
+    Serial.printf("[TG]  #%lu missing on card — dropping marker\n", (unsigned long)num);
+    return -1;
+  }
+  bool ok = tgSend(num, &f, nullptr, 0);
+  f.close();
+  return ok ? 1 : 0;
+}
+
+/*═══════════════════════════════════════════════════════════════════════╗
+║  10. Network task — WiFi roaming + queue drain                         ║
+╚═══════════════════════════════════════════════════════════════════════*/
+
+static void apStart() {
+  if (g_apOn) return;
+  WiFi.mode(WIFI_AP_STA);
+  const char* pw = (AP_PASS && strlen(AP_PASS) >= 8) ? AP_PASS : nullptr;
+  WiFi.softAP(AP_SSID, pw);
+  g_apOn = true;
+  g_rebindServer = true;      // same reason as apStop(): the mode just changed
+  Serial.printf("[AP]  \"%s\" up at 192.168.4.1%s\n", AP_SSID, pw ? "" : " (open)");
+}
+static void apStop() {
+  if (!g_apOn) return;
+  WiFi.softAPdisconnect(true);
+  g_apOn = false;
+  // softAPdisconnect(true) changes the WiFi mode underneath us, which
+  // recreates the netifs and leaves the listening socket pointing at nothing.
+  // Rebinding is not optional here.
+  g_rebindServer = true;
+  Serial.println("[AP]  down — radio dedicated to the uplink, rebinding server");
+}
+
+/*
+  Asks the camera's own web server for "/" over TCP, from netTask, while
+  loop() serves it. This settles the "can't load the page" question without
+  needing a phone or a laptop at all:
+    PASS -> the server is listening and replying on this exact IP, so anything
+            that still cannot reach it is being blocked by the network.
+    FAIL -> the fault is in here, and the reason string says which half.
+*/
+/*
+  Verifies the web server over LOOPBACK, never over our own LAN address.
+  lwIP does not route a device's own unicast address back to itself, so
+  connecting to WiFi.localIP() is refused even when the server is perfectly
+  healthy — that false negative sent me chasing a working server for two
+  rounds. 127.0.0.1 exercises the same accept path and tells the truth.
+
+  A PASS here means the server accepts and answers HTTP. It says nothing
+  about whether packets from your phone survive the air gap — read RSSI for
+  that.
+*/
+static bool webSelfTest(char* detail, size_t n) {
+  if (!server.listening()) { snprintf(detail, n, "listening flag is FALSE"); return false; }
+  WiFiClient c;
+  if (!c.connect(IPAddress(127, 0, 0, 1), 80, 3000)) {
+    snprintf(detail, n, "loopback refused despite listening flag");
+    return false;
+  }
+  c.print(F("GET / HTTP/1.0\r\nHost: self\r\nConnection: close\r\n\r\n"));
+  String line;
+  uint32_t t0 = millis();
+  while (millis() - t0 < 6000) {
+    if (c.available()) {
+      char ch = (char)c.read();
+      if (ch == '\n') break;
+      if (ch != '\r' && line.length() < 60) line += ch;
+    } else if (!c.connected()) {
+      break;
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+  }
+  c.stop();
+  if (!line.length()) { snprintf(detail, n, "connected but no reply (loop stalled?)"); return false; }
+  snprintf(detail, n, "%s", line.c_str());
+  return line.indexOf("200") >= 0;
+}
+
+/*
+  Scans and reports the RSSI of every configured network it can see, returning
+  the index of the strongest. With three networks saved, the camera may well be
+  clinging to the weakest one simply because that is what it found first.
+*/
+static int scanForBest(int* bestRssi, char* bestSsid, size_t n) {
+  int found = -1;
+  *bestRssi = -127;
+  int cnt = WiFi.scanNetworks(false, false);
+  for (int i = 0; i < cnt; i++) {
+    String s = WiFi.SSID(i);
+    int r = WiFi.RSSI(i);
+    for (int k = 0; k < 3; k++) {
+      if (g_ssid[k][0] && s.equals(g_ssid[k])) {
+        Serial.printf("[STA]   known network \"%s\"  %d dBm\n", s.c_str(), r);
+        if (r > *bestRssi) {
+          *bestRssi = r;
+          found = k;
+          if (bestSsid && n) strlcpy(bestSsid, s.c_str(), n);
+        }
+      }
+    }
+  }
+  WiFi.scanDelete();
+  return found;
+}
+
+// Weak link? See whether one of the other saved networks is materially
+// better and move to it. Only runs when the current link is already poor,
+// because the scan itself briefly interrupts traffic.
+static void maybeRoam() {
+  static uint32_t lastCheck = 0;
+  if (millis() - lastCheck < 120000UL) return;
+  lastCheck = millis();
+  int cur = WiFi.RSSI();
+  if (cur > ROAM_TRIGGER_DBM) return;
+
+  Serial.printf("[STA] link at %d dBm — checking for a better known network\n", cur);
+  int best; char bs[33] = {0};
+  int idx = scanForBest(&best, bs, sizeof bs);
+  if (idx >= 0 && best > cur + ROAM_MARGIN_DBM && !WiFi.SSID().equals(bs)) {
+    Serial.printf("[STA] roaming to \"%s\" (%d dBm, was %d)\n", bs, best, cur);
+    WiFi.begin(g_ssid[idx], g_pass[idx]);
+  } else {
+    Serial.println("[STA] nothing better in range — this is as good as it gets here");
+  }
+}
+
+// The link, not the server, is what decides whether a page ever loads.
+static void reportLinkQuality() {
+  int rssi = WiFi.RSSI();
+  const char* verdict = rssi > -60 ? "good"
+                      : rssi > -70 ? "usable"
+                      : rssi > -80 ? "WEAK - expect stalls and timeouts"
+                                   : "UNUSABLE";
+  Serial.printf("[STA] link quality: %d dBm (%s)\n", rssi, verdict);
+  if (rssi <= -70) {
+    Serial.println(
+      "      Check the ANTENNA JUMPER on the underside of the ESP32-CAM: the\n"
+      "      three pads beside the gold PCB antenna. Bridged toward the IPEX\n"
+      "      socket with no external antenna fitted collapses range - this is\n"
+      "      the most common cause of a weak ESP32-CAM link. Otherwise move it\n"
+      "      closer to the router and re-check.");
+  }
+}
+
+// Disconnect reasons are the single most useful thing in the log when uploads
+// go slow: reason 2/15 = auth/handshake, 4 = assoc expired (weak signal),
+// 8/200-205 = the AP dropped us, 201 = AP not found.
+static void onWiFiEvent(WiFiEvent_t ev, WiFiEventInfo_t info) {
+  if (ev == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    g_wifiDrops++;
+    Serial.printf("[STA] DISCONNECTED (reason %d, drop #%lu)\n",
+                  info.wifi_sta_disconnected.reason, (unsigned long)g_wifiDrops);
+  } else if (ev == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    Serial.printf("[STA] got IP %s\n", WiFi.localIP().toString().c_str());
+  }
+}
+
+static void syncTime() {
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  setenv("TZ", TZ_INFO, 1);
+  tzset();
+  for (int i = 0; i < 20 && !g_timeOK; i++) {
+    if (time(nullptr) > 1700000000) g_timeOK = true;
+    else vTaskDelay(pdMS_TO_TICKS(250));
+  }
+  if (g_timeOK) Serial.println("[NTP] clock set — SD files get real timestamps");
+}
+
+static void netTaskFn(void*) {
+  uint32_t backoff = 2000, lastTry = 0, lastOnline = 0;
+  int quickTries = 0;
+  bool wasUp = false;
+
+  for (;;) {
+    bool up = (WiFi.status() == WL_CONNECTED);
+
+    if (!up) {
+      if (millis() - lastTry > backoff) {
+        lastTry = millis();
+        if (!g_apOn) apStart();                 // always reachable while hunting
+
+        // A plain reconnect to the AP we were just on takes ~1 s. A full
+        // wifiMulti scan takes 3-5 s and jams the radio while it runs, so
+        // only fall back to it when the quick path has failed twice.
+        bool got = false;
+        if (quickTries < 2 && WiFi.SSID().length()) {
+          Serial.printf("[STA] quick reconnect to \"%s\"\n", WiFi.SSID().c_str());
+          WiFi.reconnect();
+          for (int i = 0; i < 30 && !got; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            got = (WiFi.status() == WL_CONNECTED);
+          }
+          quickTries++;
+        }
+        if (!got) {
+          Serial.println("[STA] scanning for a known network...");
+          got = (wifiMulti.run(9000) == WL_CONNECTED);
+          quickTries = 0;
+        }
+        if (got) {
+          backoff = 2000;
+        } else {
+          // Cap at 15 s, not 60. A minute of dead air per retry is how a
+          // marginal link turns into ten-minute delivery times.
+          backoff = backoff < 15000 ? backoff * 2 : 15000;
+          Serial.printf("[STA] no luck, retry in %lu s\n", (unsigned long)backoff / 1000);
+        }
+      }
+    } else {
+      quickTries = 0;
+      lastOnline = millis();
+      if (!wasUp) {
+        wasUp = true;
+        String ip = WiFi.localIP().toString();
+        Serial.printf("\n[STA] connected to \"%s\"  RSSI=%d\n", WiFi.SSID().c_str(), WiFi.RSSI());
+        Serial.printf(">>>>>  http://%s/   <<<<<\n", ip.c_str());
+        Serial.printf("      gateway %s  mask %s  mac %s\n\n",
+                      WiFi.gatewayIP().toString().c_str(),
+                      WiFi.subnetMask().toString().c_str(),
+                      WiFi.macAddress().c_str());
+
+        // mDNS has to be (re)registered now that the STA holds an address,
+        // otherwise kewlcam.local only ever answers on the AP interface.
+        MDNS.end();
+        if (MDNS.begin("kewlcam")) {
+          MDNS.addService("http", "tcp", 80);
+          Serial.println("[mDNS] kewlcam.local registered on the STA interface");
+        }
+
+        // The listening socket was bound in setup(), before this interface
+        // existed. Rebind it now so there is no doubt it accepts on the LAN.
+        g_rebindServer = true;
+
+        if (!g_timeOK) syncTime();
+
+        // Plenty of phone browsers (Chrome/Kiwi on Android among them) will
+        // not resolve .local at all. Put the raw URL somewhere it cannot be
+        // missed instead of relying on discovery.
+        // Let loop() finish the rebind, then prove the server actually answers.
+        // begin() cannot report failure, so the self-test IS the error check —
+        // if it fails, free what we can and rebind again.
+        char st[80];
+        bool webOK = false;
+        for (int attempt = 0; attempt < 4 && !webOK; attempt++) {
+          vTaskDelay(pdMS_TO_TICKS(500));
+          webOK = webSelfTest(st, sizeof st);
+          if (webOK) break;
+          Serial.printf("[Web] self-test FAIL (%s) heap=%luK — rebinding (try %d)\n",
+                        st, (unsigned long)(ESP.getFreeHeap() / 1024), attempt + 1);
+          tgClose();                 // hand mbedtls' ~40 KB back before retrying
+          g_rebindServer = true;
+        }
+        Serial.printf("[Web] self-test: %s (%s)\n", webOK ? "PASS" : "FAIL", st);
+        reportLinkQuality();
+
+        // Only when the address actually changes, so a flapping link cannot
+        // turn into a stream of identical messages.
+        static String announced;
+        if (announced != ip) {
+          char msg[420];
+          snprintf(msg, sizeof msg,
+                   "KewlCam online\nNetwork: %s\nWeb UI: http://%s/\nGateway: %s\n"
+                   "Signal: %d dBm (%s)\nQueued: %lu\nWeb server: %s\n%s",
+                   WiFi.SSID().c_str(), ip.c_str(),
+                   WiFi.gatewayIP().toString().c_str(),
+                   WiFi.RSSI(),
+                   WiFi.RSSI() > -60 ? "good" : WiFi.RSSI() > -70 ? "usable" : "WEAK",
+                   (unsigned long)g_pending,
+                   webOK ? "listening OK" : st,
+                   WiFi.RSSI() <= -70
+                     ? "Signal is weak - that is what makes pages time out and "
+                       "uploads crawl. Check the antenna jumper on the underside "
+                       "of the board, or move it nearer the router."
+                     : "");
+          if (tgSendText(msg)) announced = ip;
+        }
+      }
+
+      // Card-less fallback: one shot may be sitting in PSRAM.
+      if (g_ramBuf && g_ramLen) {
+        if (tgSend(g_ramNum, nullptr, g_ramBuf, g_ramLen)) {
+          g_sentTotal++; prefsSaveCounters();
+          free(g_ramBuf); g_ramBuf = nullptr; g_ramLen = 0;
+          blink(2);
+        }
+      }
+
+      // Drain the on-card queue, oldest first, back to back. Nothing except a
+      // per-photo browser claim is allowed to hold this up.
+      if (g_sdOK && g_pending) {
+        uint32_t n = queueFirstSendable();
+        if (n) {
+          int r = tgSendQueued(n);
+          if (r != 0) {                          // delivered, or gone for good
+            queueRemove(n);
+            if (r > 0) { g_sentTotal++; blink(2); }
+            g_sendFails = 0; g_firstFailMs = 0;
+            prefsSaveCounters();
+            g_lastActivity = millis();
+            continue;                            // straight on to the next one
+          }
+          g_sendFails++;
+          if (!g_firstFailMs) g_firstFailMs = millis();
+          // 1, 2, 4, 8 s ... capped at 15. Fast enough to ride out a blip,
+          // slow enough not to hammer a genuinely dead uplink.
+          uint32_t wait = 1000UL << (g_sendFails < 4 ? g_sendFails - 1 : 3);
+          vTaskDelay(pdMS_TO_TICKS(wait > 15000 ? 15000 : wait));
+        } else {
+          g_pending = queueCount();              // marker vanished, resync
+        }
+      }
+
+      maybeRoam();      // must sit outside the BOT_COMMANDS branches
+
+#if BOT_COMMANDS
+      // Only once the queue is empty — delivering photos always outranks
+      // listening for commands. The poll aborts itself the moment a new
+      // photo is queued, so the button never waits on it.
+      if (!g_pending) {
+        // Under memory pressure a held-open TLS session is what tips socket()
+        // into failing, which silently kills the web server. Commands get a
+        // little slower; the web UI stays alive. That is the right trade.
+        if (ESP.getFreeHeap() < 60000) {
+          tgClose();
+          vTaskDelay(pdMS_TO_TICKS(3000));
+        } else if (tgPollCommands()) {
+          continue;
+        }
+      }
+#else
+      // Do not sit on an idle TLS session; it is ~40 KB of heap.
+      if (g_tg.connected() && millis() - g_tgIdleSince > 20000) tgClose();
+#endif
+    }
+
+    if (wasUp && !up) { wasUp = false; Serial.println("[STA] link lost"); }
+
+#if AP_AUTO_OFF
+    if (up && g_apOn && !g_apManual && WiFi.softAPgetStationNum() == 0 &&
+        millis() - g_bootMs > AP_GRACE_MS) apStop();
+#endif
+
+    // WiFi stack wedged with credentials that should work → let the watchdog
+    // path recycle it rather than sitting dark forever.
+    if (!up && lastOnline && millis() - lastOnline > 900000UL) {
+      Serial.println("[STA] 15 min offline — restarting WiFi stack");
+      lastOnline = millis();
+      WiFi.disconnect(true);
+      vTaskDelay(pdMS_TO_TICKS(500));
+      WiFi.mode(WIFI_AP_STA);
+      apStart();
+    }
+
+    // Sleep until something happens, or 1 s, whichever is first.
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+  }
+}
+
+/*═══════════════════════════════════════════════════════════════════════╗
+║  11. HTTP handlers                                                     ║
+╚═══════════════════════════════════════════════════════════════════════*/
+
+static void touch() { g_lastActivity = millis(); }
+
+// Can the camera deliver on its own? If not, an open browser relays for it.
+static bool offloadWanted();
+
+static void handleRoot() {
+  touch();
+  // Decisive diagnostic: if you try to load the page and this line never
+  // appears, the request never reached the camera at all — the network is
+  // dropping it, and no firmware change can help. If it DOES appear, the
+  // camera answered and the problem is on the browser side.
+  Serial.printf("[Web] GET / from %s\n", server.client().remoteIP().toString().c_str());
+  server.sendHeader("Cache-Control", "max-age=60");
+  server.send_P(200, "text/html", PAGE_HTML);
+}
+
+static void handleConfig() {
+  touch();
+  char b[256];
+  snprintf(b, sizeof b, "{\"token\":\"%s\",\"chat\":\"%s\"}", BOT_TOKEN, CHAT_ID);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", b);
+}
+
+/*
+  Capture → SD → stream back. The photo IS queued, and the browser clears the
+  marker via /sent once its own upload succeeds. Queuing first means closing
+  the page, losing the tab, or any JS error leaves the photo pending rather
+  than silently unsent — the camera then delivers it itself.
+*/
+static void handlePhoto() {
+  touch();
+  uint32_t num = 0;
+  if (!captureAndStore(&num, true)) { server.send(500, "text/plain", "capture failed"); return; }
+  // Give the browser first go at this one; netTask picks it up if it fails.
+  g_claimNum = num;
+  g_claimUntil = millis() + 30000;
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("X-Photo-Num", String(num));
+
+  if (g_sdOK) {
+    char p[40]; photoPath(p, sizeof p, num);
+    if (SD_LOCK(4000)) {
+      File f = SD_MMC.open(p, FILE_READ);
+      if (f) { server.streamFile(f, "image/jpeg"); f.close(); SD_UNLOCK(); return; }
+      SD_UNLOCK();
+    }
+  }
+  if (g_ramBuf && g_ramNum == num) {
+    server.send_P(200, "image/jpeg", (const char*)g_ramBuf, g_ramLen);
+    return;
+  }
+  server.send(500, "text/plain", "stored but unreadable");
+}
+
+static void handleFile() {
+  touch();
+  if (!server.hasArg("n")) { server.send(400, "text/plain", "n?"); return; }
+  uint32_t n = server.arg("n").toInt();
+  if (g_ramBuf && g_ramNum == n) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send_P(200, "image/jpeg", (const char*)g_ramBuf, g_ramLen);
+    return;
+  }
+  if (!g_sdOK) { server.send(503, "text/plain", "no sd"); return; }
+  char p[40]; photoPath(p, sizeof p, n);
+  if (!SD_LOCK(4000)) { server.send(503, "text/plain", "busy"); return; }
+  File f = SD_MMC.open(p, FILE_READ);
+  if (!f) { SD_UNLOCK(); server.send(404, "text/plain", "gone"); return; }
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Cache-Control", "max-age=86400");
+  server.streamFile(f, "image/jpeg");
+  f.close();
+  SD_UNLOCK();
+  // A browser pulling a still-queued photo is relaying that one right now.
+  // Claim only that number, and only briefly.
+  if (offloadWanted()) { g_claimNum = n; g_claimUntil = millis() + 30000; }
+}
+
+static void handleList() {
+  touch();
+  int want = server.hasArg("n") ? server.arg("n").toInt() : 9;
+  want = constrain(want, 1, 40);
+  String j = "{\"list\":[";
+  int c = 0;
+  for (uint32_t n = g_lastNum; n >= g_oldestNum && n > 0 && c < want; n--) {
+    if (c) j += ',';
+    j += n;
+    c++;
+  }
+  j += "]}";
+  server.send(200, "application/json", j);
+}
+
+/*
+  Ask the browser to relay only when the camera genuinely cannot deliver:
+  it is off the network, or its sends have been failing for a sustained
+  stretch. A couple of transient failures used to latch this on forever.
+*/
+static bool offloadWanted() {
+  if (WiFi.status() != WL_CONNECTED) return true;
+  return g_firstFailMs && (millis() - g_firstFailMs > 45000);
+}
+
+static void handleStatus() {
+  touch();
+  bool up = (WiFi.status() == WL_CONNECTED);
+  bool off = offloadWanted();
+  String list = "[";
+  if (off && g_sdOK && g_pending) {
+    // Hand the browser a short batch and hold netTask off it while it works.
+    uint32_t batch[5]; int n = 0;
+    g_pending = queueScan(nullptr, 0, batch, 5, &n);
+    for (int i = 0; i < n; i++) { if (i) list += ','; list += batch[i]; }
+  }
+  list += ']';
+
+  char b[768];
+  snprintf(b, sizeof b,
+    "{\"sd\":%d,\"wifi\":%d,\"ssid\":\"%s\",\"rssi\":%d,\"ip\":\"%s\","
+    "\"pending\":%lu,\"last\":%lu,\"shot\":%lu,\"sent\":%lu,"
+    "\"heap\":%lu,\"up\":%lu,\"used\":%lu,\"total\":%lu,\"offload\":%d,"
+    "\"cam\":{\"brightness\":%d,\"contrast\":%d,\"sat\":%d,\"sharpness\":%d,"
+    "\"wb_mode\":%d,\"hmirror\":%d,\"vflip\":%d,\"quality\":%d,\"res_idx\":%d,"
+    "\"flash\":%d,\"flash_duty\":%d},\"list\":%s}",
+    g_sdOK ? 1 : 0, up ? 1 : 0,
+    up ? WiFi.SSID().c_str() : AP_SSID, up ? WiFi.RSSI() : 0,
+    up ? WiFi.localIP().toString().c_str() : "192.168.4.1",
+    (unsigned long)g_pending, (unsigned long)g_lastNum,
+    (unsigned long)g_shotTotal, (unsigned long)g_sentTotal,
+    (unsigned long)ESP.getFreeHeap(), (unsigned long)(millis() / 1000),
+    (unsigned long)(g_sdOK ? SD_MMC.usedBytes() / (1024ULL * 1024ULL) : 0),
+    (unsigned long)(g_sdOK ? SD_MMC.totalBytes() / (1024ULL * 1024ULL) : 0),
+    off ? 1 : 0,
+    g_cam.brightness, g_cam.contrast, g_cam.sat, g_cam.sharpness,
+    g_cam.wb_mode, g_cam.hmirror, g_cam.vflip, g_cam.quality, g_cam.res_idx,
+    g_cam.flash, g_cam.flash_duty, list.c_str());
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", b);
+}
+
+static void handleQueueAdd() {
+  touch();
+  if (server.hasArg("n")) queueAdd(server.arg("n").toInt());
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+static void handleSent() {
+  touch();
+  if (server.hasArg("n")) {
+    queueRemove(server.arg("n").toInt());
+    g_sentTotal++; prefsSaveCounters(); blink(2);
+    // The browser got one through, so stop treating the link as broken —
+    // otherwise offload mode would latch on until the camera itself succeeds.
+    g_sendFails = 0;
+    g_firstFailMs = 0;
+    g_claimUntil = 0;
+  }
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+static void handleRetry() {
+  touch();
+  g_sendFails = 0;
+  g_firstFailMs = 0;
+  g_claimUntil = 0;
+  g_pending = queueCount();
+  if (g_netTask) xTaskNotifyGive(g_netTask);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+static void handleSettings() {
+  touch();
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) { server.send(503, "text/plain", "no sensor"); return; }
+  if (!xSemaphoreTake(g_camMux, pdMS_TO_TICKS(3000))) { server.send(503, "text/plain", "busy"); return; }
+  bool settle = false;
+  if (server.hasArg("br"))  { g_cam.brightness = constrain(server.arg("br").toInt(), -2, 2);  s->set_brightness(s, g_cam.brightness); }
+  if (server.hasArg("con")) { g_cam.contrast   = constrain(server.arg("con").toInt(), -2, 2); s->set_contrast(s, g_cam.contrast); }
+  if (server.hasArg("sat")) { g_cam.sat        = constrain(server.arg("sat").toInt(), -2, 2); s->set_saturation(s, g_cam.sat); }
+  if (server.hasArg("shp")) { g_cam.sharpness  = constrain(server.arg("shp").toInt(), -3, 3); s->set_sharpness(s, g_cam.sharpness); }
+  if (server.hasArg("wb"))  { g_cam.wb_mode    = constrain(server.arg("wb").toInt(), 0, 4);   s->set_wb_mode(s, g_cam.wb_mode); settle = true; }
+  if (server.hasArg("hm"))  { g_cam.hmirror    = server.arg("hm").toInt() ? 1 : 0;            s->set_hmirror(s, g_cam.hmirror); }
+  if (server.hasArg("vf"))  { g_cam.vflip      = server.arg("vf").toInt() ? 1 : 0;            s->set_vflip(s, g_cam.vflip); }
+  if (server.hasArg("q"))   { g_cam.quality    = constrain(server.arg("q").toInt(), 6, 30);   s->set_quality(s, g_cam.quality); }
+  if (server.hasArg("fx"))  { g_cam.effect     = constrain(server.arg("fx").toInt(), 0, 6);   s->set_special_effect(s, g_cam.effect); settle = true; }
+  if (server.hasArg("fl"))  { g_cam.flash      = server.arg("fl").toInt() ? 1 : 0; }
+  if (server.hasArg("fd"))  { g_cam.flash_duty = constrain(server.arg("fd").toInt(), 0, 255); }
+  bool resChanged = false;
+  if (server.hasArg("res")) {
+    int want = constrain(server.arg("res").toInt(), 0, 5);
+    resChanged = (want != g_cam.res_idx);
+    g_cam.res_idx = want;
+  }
+  // Buffers are sized for the current resolution, so growing needs a re-init.
+  if (resChanged) reinitCamera();
+  xSemaphoreGive(g_camMux);
+  if (settle) delay(120);
+  g_cfgDirtyAt = millis();            // NVS write is debounced in loop()
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+static void handleWifiGet() {
+  touch();
+  String j = "{\"nets\":[";
+  for (int i = 0; i < 3; i++) {
+    if (i) j += ',';
+    j += "{\"ssid\":\"" + String(g_ssid[i]) + "\",\"set\":" + (g_pass[i][0] ? "true" : "false") + "}";
+  }
+  j += "]}";
+  server.send(200, "application/json", j);
+}
+// Async scan so the web server is never blocked for the 2-3 s a scan takes.
+// Poll it: first call starts one, later calls return the result.
+static void handleScan() {
+  touch();
+  int n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_RUNNING) {
+    server.send(200, "application/json", "{\"scanning\":true,\"nets\":[]}");
+    return;
+  }
+  if (n < 0) {
+    WiFi.scanNetworks(true, false);
+    server.send(200, "application/json", "{\"scanning\":true,\"nets\":[]}");
+    return;
+  }
+  String j = "{\"scanning\":false,\"nets\":[";
+  int c = 0;
+  for (int i = 0; i < n && c < 20; i++) {
+    String s = WiFi.SSID(i);
+    if (!s.length()) continue;
+    s.replace("\\", "\\\\");
+    s.replace("\"", "\\\"");
+    if (c) j += ',';
+    j += "{\"s\":\"" + s + "\",\"r\":" + String(WiFi.RSSI(i)) + "}";
+    c++;
+  }
+  j += "]}";
+  WiFi.scanDelete();
+  server.send(200, "application/json", j);
+}
+
+static void handleWifiSet() {
+  touch();
+  if (!xSemaphoreTake(g_nvsMux, pdMS_TO_TICKS(2000))) { server.send(503, "text/plain", "busy"); return; }
+  for (int i = 0; i < 3; i++) {
+    char ks[8], kp[8];
+    snprintf(ks, sizeof ks, "s%d", i);
+    snprintf(kp, sizeof kp, "p%d", i);
+    if (server.hasArg(ks)) prefs.putString(ks, server.arg(ks));
+    if (server.hasArg(kp)) prefs.putString(kp, server.arg(kp));
+  }
+  xSemaphoreGive(g_nvsMux);
+  server.send(200, "application/json", "{\"ok\":true,\"reboot\":true}");
+  delay(300);
+  ESP.restart();                       // simplest way to rebuild the AP list
+}
+
+static void handleReboot() {
+  server.send(200, "text/plain", "rebooting");
+  delay(200);
+  ESP.restart();
+}
+
+static void handleUpdateDone() {
+  server.send(200, "text/plain", Update.hasError() ? "FAIL" : "OK — rebooting");
+  delay(300);
+  ESP.restart();
+}
+static void handleUpdateUpload() {
+  HTTPUpload& u = server.upload();
+  if (u.status == UPLOAD_FILE_START) {
+    Serial.printf("[OTA] start: %s\n", u.filename.c_str());
+    s_btnArmed = false;
+    detachInterrupt(digitalPinToInterrupt(BUTTON_PIN));
+    if (g_camTask) vTaskSuspend(g_camTask);
+    if (g_netTask) vTaskSuspend(g_netTask);
+    FLASH_WRITE(0);
+    esp_camera_deinit();
+    SD_MMC.end();
+    if (g_ramBuf) { free(g_ramBuf); g_ramBuf = nullptr; g_ramLen = 0; }
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+  } else if (u.status == UPLOAD_FILE_WRITE) {
+    esp_task_wdt_reset();              // a 1.5 MB upload outlasts the WDT window
+    if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
+  } else if (u.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) Serial.printf("[OTA] done: %u bytes\n", u.totalSize);
+    else Update.printError(Serial);
+  }
+}
+
+/*═══════════════════════════════════════════════════════════════════════╗
+║  12. Setup                                                             ║
+╚═══════════════════════════════════════════════════════════════════════*/
+
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);   // ESP32-CAM false-trips this
+  setCpuFrequencyMhz(CPU_MHZ);
+  Serial.begin(115200);
+  Serial.setDebugOutput(false);
+  delay(80);
+  Serial.println("\n\n===== KewlCam v2 =====");
+  g_bootMs = millis();
+  Serial.printf("[MEM] boot          heap=%luK\n", (unsigned long)(ESP.getFreeHeap() / 1024));
+
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  ledSet(true);                                // solid = booting
+
+  g_camMux = xSemaphoreCreateMutex();
+  g_sdMux  = xSemaphoreCreateRecursiveMutex();
+  g_nvsMux = xSemaphoreCreateMutex();
+
+  prefsLoad();
+
+  g_camOK = initCamera();
+  Serial.printf("[CAM] %s  psram=%s\n", g_camOK ? "ready" : "FAILED",
+                psramFound() ? "yes" : "NO");
+
+  Serial.printf("[MEM] after camera  heap=%luK\n", (unsigned long)(ESP.getFreeHeap() / 1024));
+
+  g_sdOK = sdMount();
+  if (!g_sdOK) Serial.println("[SD]  NOT AVAILABLE — photos fall back to PSRAM");
+  Serial.printf("[MEM] after SD      heap=%luK\n", (unsigned long)(ESP.getFreeHeap() / 1024));
+  g_pending = queueCount();
+  Serial.printf("[SD]  next photo #%lu, %lu queued for sending\n",
+                (unsigned long)g_nextNum, (unsigned long)g_pending);
+
+  // After SD init: the driver leaves a pull-up on DAT3/GPIO13 that we replace.
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.mode(WIFI_AP_STA);
+  // Must come AFTER mode() or it never reaches the DHCP client. Worth having:
+  // many routers then resolve http://kewlcam/ on their own, which works on
+  // Android where .local does not.
+  WiFi.setHostname("kewlcam");
+  WiFi.setSleep(false);                 // modem sleep costs 100+ ms per packet
+  WiFi.onEvent(onWiFiEvent);
+  apStart();
+  for (int i = 0; i < 3; i++) {
+    if (g_ssid[i][0]) {
+      wifiMulti.addAP(g_ssid[i], g_pass[i]);
+      Serial.printf("[STA] slot %d: \"%s\"\n", i + 1, g_ssid[i]);
+    }
+  }
+  // Full TX power. Trimming it saved a little current but cost link margin,
+  // which is the difference between joining the house network and falling
+  // back to the AP.
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+  // NOTE: mDNS is (re)started by netTask once the STA actually has an IP —
+  // registering it here, before there is an address, is why kewlcam.local
+  // resolved on the AP but not on the house network.
+
+  server.on("/",            handleRoot);
+  server.on("/config.json", handleConfig);
+  server.on("/photo",       handlePhoto);
+  server.on("/file",        handleFile);
+  server.on("/list",        handleList);
+  server.on("/status",      handleStatus);
+  server.on("/queue",       handleQueueAdd);
+  server.on("/sent",        handleSent);
+  server.on("/retry",       handleRetry);
+  server.on("/settings",    handleSettings);
+  server.on("/scan",        handleScan);
+  server.on("/wifi", HTTP_GET,  handleWifiGet);
+  server.on("/wifi", HTTP_POST, handleWifiSet);
+  server.on("/reboot",      handleReboot);
+  server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
+  server.onNotFound([]() {
+    Serial.printf("[Web] 404 %s from %s\n", server.uri().c_str(),
+                  server.client().remoteIP().toString().c_str());
+    server.send(404, "text/plain", "Not found");
+  });
+  server.begin();
+  Serial.printf("[Web] begin: listening=%s\n", server.listening() ? "YES" : "NO");
+  Serial.printf("[MEM] after AP+web  heap=%luK\n", (unsigned long)(ESP.getFreeHeap() / 1024));
+
+  // camTask on core 1 at high priority: nothing the web server or the uploader
+  // is doing can delay the shutter.
+  xTaskCreatePinnedToCore(camTaskFn, "cam", 8192, nullptr, 5, &g_camTask, 1);
+  // Roomy: the mbedtls handshake alone wants several KB on top of the
+  // multipart and command buffers.
+  xTaskCreatePinnedToCore(netTaskFn, "net", 14336, nullptr, 2, &g_netTask, 0);
+
+  s_btnArmed = true;
+  restoreButtonPin();
+  Serial.printf("[BTN] GPIO %d -> GND, interrupt armed\n", BUTTON_PIN);
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  esp_task_wdt_config_t wcfg = { .timeout_ms = WDT_SECONDS * 1000, .idle_core_mask = 0, .trigger_panic = true };
+  esp_task_wdt_reconfigure(&wcfg);
+#else
+  esp_task_wdt_init(WDT_SECONDS, true);
+#endif
+  esp_task_wdt_add(nullptr);
+
+  ledSet(false);
+  blink(3);
+  g_lastActivity = millis();
+  Serial.println("===== ready =====\n");
+}
+
+/*═══════════════════════════════════════════════════════════════════════╗
+║  13. Loop — web server, LED, supervision                               ║
+╚═══════════════════════════════════════════════════════════════════════*/
+
+void loop() {
+  esp_task_wdt_reset();
+
+  if (g_rebindServer) {
+    g_rebindServer = false;
+    server.close();
+    server.begin();
+    if (!server.listening()) {          // begin() cannot report this itself
+      Serial.println("[Web] rebind FAILED — retrying once");
+      delay(200);
+      server.close();
+      server.begin();
+    }
+    Serial.printf("[Web] rebind: listening=%s  heap=%luK\n",
+                  server.listening() ? "YES" : "NO",
+                  (unsigned long)(ESP.getFreeHeap() / 1024));
+  }
+
+  server.handleClient();
+
+  // Non-blocking blink playback.
+  if (g_blinks > 0 && millis() - g_ledAt > 110) {
+    g_ledAt = millis();
+    ledSet(!g_ledOn);
+    if (!g_ledOn) g_blinks--;
+  } else if (g_blinks == 0 && g_ledOn && !g_busyCapture) {
+    ledSet(false);
+  }
+
+  // Debounced settings persistence — a slider drag is one NVS write, not fifty.
+  if (g_cfgDirtyAt && millis() - g_cfgDirtyAt > 2500) {
+    g_cfgDirtyAt = 0;
+    prefsSaveCam();
+  }
+
+  // Heartbeat: the one line that shows whether the link, the heap or the queue
+  // is the thing going wrong. Send me 2 minutes of these if it is still slow.
+  static uint32_t lastBeat = 0;
+  if (millis() - lastBeat > 30000) {
+    lastBeat = millis();
+    Serial.printf("[HB]  %lus  wifi=%s rssi=%d drops=%lu  ap=%d  pend=%lu sent=%lu shot=%lu  heap=%luK\n",
+                  (unsigned long)(millis() / 1000),
+                  WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "DOWN",
+                  WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0,
+                  (unsigned long)g_wifiDrops, g_apOn ? 1 : 0,
+                  (unsigned long)g_pending, (unsigned long)g_sentTotal,
+                  (unsigned long)g_shotTotal,
+                  (unsigned long)(ESP.getFreeHeap() / 1024));
+  }
+
+  static uint32_t lastCheck = 0;
+  if (millis() - lastCheck > 10000) {
+    lastCheck = millis();
+    g_pending = queueCount();
+
+    // Camera wedged (bad power, sensor lockup) → rebuild it in place.
+    if (g_camFails >= 5) {
+      Serial.println("[CAM] repeated failures — reinitialising");
+      if (xSemaphoreTake(g_camMux, pdMS_TO_TICKS(3000))) {
+        esp_camera_deinit();
+        delay(200);
+        g_camOK = initCamera();
+        xSemaphoreGive(g_camMux);
+      }
+      g_camFails = g_camOK ? 0 : 99;
+      if (!g_camOK) { Serial.println("[CAM] unrecoverable — rebooting"); delay(200); ESP.restart(); }
+    }
+
+    // Card pulled or died → keep retrying the mount in the background.
+    if (!g_sdOK) {
+      g_sdOK = sdMount();
+      if (g_sdOK) { g_pending = queueCount(); Serial.println("[SD]  back online"); }
+    }
+
+    if (ESP.getFreeHeap() < 20000) {
+      Serial.println("[SYS] heap exhausted — rebooting");
+      delay(200);
+      ESP.restart();
+    }
+
+#if AUTO_REBOOT_HOURS
+    bool idle = !g_pending && !g_busyCapture &&
+                (millis() - g_lastActivity > 300000UL) &&
+                WiFi.softAPgetStationNum() == 0;
+    if (idle && millis() > (uint32_t)AUTO_REBOOT_HOURS * 3600000UL) {
+      Serial.println("[SYS] scheduled idle reboot");
+      delay(200);
+      ESP.restart();
+    }
+#endif
+  }
+
+  delay(1);   // yields to the idle task; the button path does not go through here
+}
